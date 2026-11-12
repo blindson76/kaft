@@ -87,7 +87,7 @@ func (rc *ClusterBootstrapController) Start(ctx context.Context) error {
 					log.Printf("Already bootstraped, Skipping bootstrap...")
 					break
 				case <-t.C:
-					if err := rc.c.Bootstrap(ctx, rc.nodes); err != nil {
+					if err := rc.c.Bootstrap(ctx, activeNodes); err != nil {
 						return err
 					}
 				}

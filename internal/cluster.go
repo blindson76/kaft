@@ -17,9 +17,9 @@ import (
 )
 
 type ClusterFSM struct {
-	data        map[string]string
 	timeMachine *gstate.Machine[string, string, timefsm.TimeMachine]
 	timeActor   *gstate.Actor[string, string, timefsm.TimeMachine]
+	stepCh      chan struct{}
 }
 
 type Command struct {
@@ -36,52 +36,54 @@ func (fsm *ClusterFSM) Apply(l *raft.Log) interface{} {
 	}
 
 	switch cmd.Op {
-	case "SET":
-		fsm.data[cmd.Key] = cmd.Value
-		return nil
+	case "FIRE":
+		fsm.timeActor.Send(cmd.Value)
 	default:
 		return fmt.Errorf("unknown operation: %s", cmd.Op)
 	}
+	return fsm.timeActor.Snapshot()
 }
 
 func (fsm *ClusterFSM) Snapshot() (raft.FSMSnapshot, error) {
-	clone := make(map[string]string)
-	for k, v := range fsm.data {
-		clone[k] = v
+	snap := fsm.timeActor.Snapshot()
+	log.Printf("Snapshot machine:%v", snap)
+	bytes, err := json.Marshal(snap)
+	if err != nil {
+		return nil, err
 	}
-	return &ClusterSnapshot{data: clone}, nil
+	return &ClusterSnapshot{data: bytes}, nil
 }
 
 func (fsm *ClusterFSM) Restore(rc io.ReadCloser) error {
+	log.Println("Restoring machine")
 	defer rc.Close()
-	var data map[string]string
-	if err := json.NewDecoder(rc).Decode(&data); err != nil && err != io.EOF {
+	var snap gstate.Snapshot[string, timefsm.TimeMachine]
+	if err := json.NewDecoder(rc).Decode(&snap); err != nil {
 		return err
 	}
-	fsm.data = data
+
+	if fsm.timeActor != nil {
+		fsm.timeActor.Stop()
+	}
+
+	// Disable automatic invoke/timer restarts on restore to preserve determinism
+	fsm.timeActor = gstate.Hydrate(
+		fsm.timeMachine,
+		snap,
+		fsm.timeMachine.WithHydrateServices(false),
+	)
 	return nil
 }
 
 // --- 2. Snapshot Serialization ---
 
 type ClusterSnapshot struct {
-	data map[string]string
+	data []byte
 }
 
 func (s *ClusterSnapshot) Persist(sink raft.SnapshotSink) error {
-	err := func() error {
-		b, err := json.Marshal(s.data)
-		if err != nil {
-			return err
-		}
-		if _, err := sink.Write(b); err != nil {
-			return err
-		}
-		return nil
-	}()
-
-	if err != nil {
-		sink.Cancel()
+	if _, err := sink.Write(s.data); err != nil {
+		_ = sink.Cancel()
 		return err
 	}
 	return sink.Close()
@@ -181,12 +183,13 @@ func (c *Cluster) Start(ctx context.Context) {
 
 	// 5. Initialize the volatile State Machine
 	timeMachine := timefsm.NewMachine()
-	timeActor := gstate.Start(timeMachine, timefsm.TimeMachine{}, timeMachine.WithServiceActivation(false))
-
+	timeActor := gstate.Start(timeMachine, timefsm.TimeMachine{}, timeMachine.WithServiceActivation(false), timeMachine.WithRaiseHandler(func(ctx context.Context, e gstate.RaisedEvent[string, string]) {
+		log.Printf("Machine internal event:%v", e)
+	}))
 	fsm := &ClusterFSM{
-		data:        make(map[string]string),
 		timeMachine: timeMachine,
 		timeActor:   timeActor,
+		stepCh:      make(chan struct{}, 1),
 	}
 
 	// 6. Instantiate Raft Node using pure in-memory parameters
@@ -227,6 +230,20 @@ func (c *Cluster) Start(ctx context.Context) {
 			}
 
 		}
+	}()
+	go func() {
+
+		ticker := time.NewTicker(time.Second)
+		for {
+			<-ticker.C
+			if r.State() == raft.Leader {
+				log.Println("send tick")
+				fsm.timeActor.Send("tick")
+				continue
+			}
+
+		}
+
 	}()
 	c.bsManager.Start(ctx)
 

@@ -1,5 +1,7 @@
 github.com/blindson76/gstate v0.0.0-20261111155458-03e742e416da h1:sDsclyk0KnyY6p+xskG0Rl6d2dvrftvzjqEQevNqJSc=
 github.com/blindson76/gstate v0.0.0-20261111155458-03e742e416da/go.mod h1:J981WvccOG3uUfkmWU3iAVx4CwLvTK2B7DjNhDVhbGI=
+github.com/blindson76/gstate v0.0.0-20261112150914-e8a6957bd403 h1:/qmRheQMt2HosHcBjh6aL4yCUE/3oIQOf70zDKXN+m4=
+github.com/blindson76/gstate v0.0.0-20261112150914-e8a6957bd403/go.mod h1:J981WvccOG3uUfkmWU3iAVx4CwLvTK2B7DjNhDVhbGI=
 github.com/davecgh/go-spew v1.1.0/go.mod h1:J7Y8YcW2NihsgmVo/mv3lAwl/skON4iLHjSsI+c5H38=
 github.com/davecgh/go-spew v1.1.1/go.mod h1:J7Y8YcW2NihsgmVo/mv3lAwl/skON4iLHjSsI+c5H38=
 github.com/fatih/color v1.13.0 h1:8LOYc1KYPPmyKMuN8QV2DNRWNbLo6LZ0iLs8+mlH53w=
