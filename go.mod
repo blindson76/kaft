@@ -3,7 +3,7 @@ module example.com/dstate
 go 1.27.0
 
 require (
-	github.com/blindson76/gstate v0.0.0-20261112150914-e8a6957bd403 // indirect
+	github.com/blindson76/gstate v0.0.0-20261113043236-8ddfb949dd95 // indirect
 	github.com/fatih/color v1.13.0 // indirect
 	github.com/hashicorp/go-hclog v1.6.3 // indirect
 	github.com/hashicorp/go-immutable-radix v1.3.1 // indirect

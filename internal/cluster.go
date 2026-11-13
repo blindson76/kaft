@@ -185,6 +185,7 @@ func (c *Cluster) Start(ctx context.Context) {
 	timeMachine := timefsm.NewMachine()
 	timeActor := gstate.Start(timeMachine, timefsm.TimeMachine{}, timeMachine.WithServiceActivation(false), timeMachine.WithRaiseHandler(func(ctx context.Context, e gstate.RaisedEvent[string, string]) {
 		log.Printf("Machine internal event:%v", e)
+		c.Send(e.Event)
 	}))
 	fsm := &ClusterFSM{
 		timeMachine: timeMachine,
@@ -236,15 +237,27 @@ func (c *Cluster) Start(ctx context.Context) {
 		ticker := time.NewTicker(time.Second)
 		for {
 			<-ticker.C
-			if r.State() == raft.Leader {
-				log.Println("send tick")
-				fsm.timeActor.Send("tick")
-				continue
-			}
 
 		}
 
 	}()
 	c.bsManager.Start(ctx)
 
+}
+
+func (c *Cluster) Send(event string, val ...any) {
+	if c.r.State() != raft.Leader {
+		return
+	}
+	command := Command{
+		Op:    "FIRE",
+		Value: event,
+	}
+	payload, err := json.Marshal(command)
+	if err != nil {
+		fmt.Printf("Failed to marshall command. %v : %w", command, err)
+		return
+	}
+	log.Printf("Sending event %v", event)
+	c.r.Apply(payload, 2*time.Second)
 }

@@ -1,6 +1,7 @@
 package time
 
 import (
+	"context"
 	"log"
 	"time"
 
@@ -21,11 +22,10 @@ func NewMachine() *gstate.Machine[string, string, TimeMachine] {
 		State("init", func(sb *gstate.StateBuilder[string, string, TimeMachine]) {
 			sb.On("timeout").Assign(func(m TimeMachine) TimeMachine {
 				log.Printf("preassign\n")
-				time.Sleep(3 * time.Second)
 				log.Printf("postassign\n")
 				return m
 			}).GoTo("ready")
-			sb.After(time.Second * 5).Raise("timeout")
+			sb.After(time.Second * 10).Raise("timeout")
 			sb.Entry(func(m TimeMachine) TimeMachine {
 				log.Printf("Entry init\n")
 				return m
@@ -35,6 +35,22 @@ func NewMachine() *gstate.Machine[string, string, TimeMachine] {
 				tm.counter++
 				return tm
 			})
+			sb.Invoke(func(ctx context.Context, snap TimeMachine, mutate func(func(TimeMachine) TimeMachine)) error {
+
+				ticker := time.NewTicker(time.Second)
+				defer ticker.Stop()
+				for {
+					select {
+					case <-ticker.C:
+						log.Println("ticker")
+						gstate.Raise(ctx, "tick")
+					case <-ctx.Done():
+						log.Println("exit")
+						return ctx.Err()
+
+					}
+				}
+			}, "init", "init")
 		}).
 		State("ready", func(sb *gstate.StateBuilder[string, string, TimeMachine]) {
 			sb.Entry(func(m TimeMachine) TimeMachine {
