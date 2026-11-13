@@ -9,7 +9,7 @@ import (
 
 type ClusterManager interface {
 	Bootstrap(context.Context, []string) error
-	Join(string)
+	Join(context.Context, string)
 	WaitNode(context.Context, string)
 }
 
@@ -92,7 +92,7 @@ func (rc *ClusterBootstrapController) Start(ctx context.Context) error {
 					}
 				}
 			} else if len(activeNodes) > rc.expected {
-				rc.c.Join(node)
+				go rc.c.Join(ctx, node)
 			}
 		}
 	}

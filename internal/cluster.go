@@ -137,14 +137,33 @@ func (c *Cluster) Bootstrap(ctx context.Context, nodes []string) error {
 
 }
 
-func (c *Cluster) Join(node string) {
-	log.Println("Adding new node", node, c.r.Leader())
-	if c.r.Leader() == raft.ServerAddress(c.nodeID) {
-		if err := c.r.AddVoter(raft.ServerID(node), raft.ServerAddress(c.nodesMap[node].RaftAddr), 0, time.Second*10); err != nil {
-			log.Printf("Add voter error:%v", err)
+func (c *Cluster) Join(ctx context.Context, node string) {
+	addr := raft.ServerAddress(c.nodesMap[node].RaftAddr)
+	ticker := time.NewTicker(time.Second)
+	defer ticker.Stop()
+	for {
+		if c.r.State() == raft.Leader {
+			cf := c.r.GetConfiguration()
+			if err := cf.Error(); err == nil {
+				for _, s := range cf.Configuration().Servers {
+					if s.ID == raft.ServerID(node) {
+						return
+					}
+				}
+				log.Println("Adding new node", node)
+				if err := c.r.AddVoter(raft.ServerID(node), addr, 0, 10*time.Second).Error(); err != nil {
+					log.Printf("Add voter error:%v", err)
+				} else {
+					return
+				}
+			}
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
 		}
 	}
-
 }
 func (c *Cluster) WaitNode(ctx context.Context, node string) {
 	util.WaitTCP(ctx, c.nodesMap[node].RaftAddr, 2*time.Second)
