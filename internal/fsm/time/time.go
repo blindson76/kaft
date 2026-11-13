@@ -9,7 +9,7 @@ import (
 )
 
 type TimeMachine struct {
-	counter int
+	Counter int
 }
 
 func (m TimeMachine) Clone() TimeMachine {
@@ -25,19 +25,20 @@ func NewMachine() *gstate.Machine[string, string, TimeMachine] {
 				log.Printf("postassign\n")
 				return m
 			}).GoTo("ready")
-			sb.After(time.Second * 10).Raise("timeout")
+			sb.After(time.Second * 5000).Raise("timeout")
 			sb.Entry(func(m TimeMachine) TimeMachine {
 				log.Printf("Entry init\n")
 				return m
 			})
 			sb.On("tick").Assign(func(tm TimeMachine) TimeMachine {
 				log.Printf("receive tick event: %v", tm)
-				tm.counter++
+				tm.Counter++
 				return tm
 			})
 			sb.Invoke(func(ctx context.Context, snap TimeMachine, mutate func(func(TimeMachine) TimeMachine)) error {
+				log.Printf("ACTIVATING INVOKE")
 
-				ticker := time.NewTicker(time.Second)
+				ticker := time.NewTicker(200 * time.Millisecond)
 				defer ticker.Stop()
 				for {
 					select {

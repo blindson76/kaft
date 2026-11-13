@@ -20,6 +20,7 @@ type ClusterFSM struct {
 	timeMachine *gstate.Machine[string, string, timefsm.TimeMachine]
 	timeActor   *gstate.Actor[string, string, timefsm.TimeMachine]
 	stepCh      chan struct{}
+	send        func(string) error
 }
 
 type Command struct {
@@ -29,7 +30,6 @@ type Command struct {
 }
 
 func (fsm *ClusterFSM) Apply(l *raft.Log) interface{} {
-	log.Printf("fsm Apply")
 	var cmd Command
 	if err := json.Unmarshal(l.Data, &cmd); err != nil {
 		return err
@@ -46,11 +46,12 @@ func (fsm *ClusterFSM) Apply(l *raft.Log) interface{} {
 
 func (fsm *ClusterFSM) Snapshot() (raft.FSMSnapshot, error) {
 	snap := fsm.timeActor.Snapshot()
-	log.Printf("Snapshot machine:%v", snap)
+	// log.Printf("Snapshot machine:%+v", snap)
 	bytes, err := json.Marshal(snap)
 	if err != nil {
 		return nil, err
 	}
+	// log.Printf("SNAP:%s", string(bytes))
 	return &ClusterSnapshot{data: bytes}, nil
 }
 
@@ -59,6 +60,7 @@ func (fsm *ClusterFSM) Restore(rc io.ReadCloser) error {
 	defer rc.Close()
 	var snap gstate.Snapshot[string, timefsm.TimeMachine]
 	if err := json.NewDecoder(rc).Decode(&snap); err != nil {
+		log.Printf("Restoring error:%+v", err)
 		return err
 	}
 
@@ -71,7 +73,14 @@ func (fsm *ClusterFSM) Restore(rc io.ReadCloser) error {
 		fsm.timeMachine,
 		snap,
 		fsm.timeMachine.WithHydrateServices(false),
+		fsm.timeMachine.WithServiceActivation(false),
+		fsm.timeMachine.WithRaiseHandler(func(ctx context.Context, e gstate.RaisedEvent[string, string]) {
+			// log.Printf("Machine internal event:%v", e)
+			fsm.send(e.Event)
+		}),
 	)
+
+	log.Printf("Restored machine:%+v", fsm.timeActor.Snapshot())
 	return nil
 }
 
@@ -114,7 +123,7 @@ func NewCluster(self string, cfg *ClusterConfig) *Cluster {
 		nodes:    nodes,
 		expected: cfg.ExpectedBootstrap,
 	}
-	delayBootstrap := time.Second + time.Duration(slices.Index(nodes, c.nodeID)*int(time.Second))
+	delayBootstrap := time.Second*3 + time.Duration(slices.Index(nodes, c.nodeID)*int(time.Second))
 	c.bsManager = NewClusterManager(nodes, cfg.ExpectedBootstrap, delayBootstrap, c)
 	return c
 }
@@ -179,6 +188,10 @@ func (c *Cluster) Start(ctx context.Context) {
 	config.LocalID = raft.ServerID(nodeID)
 	config.LogOutput = io.Discard
 
+	config.SnapshotInterval = time.Millisecond * 400
+	config.SnapshotThreshold = 5
+	config.TrailingLogs = 50
+
 	// Fast election speeds for single node local testing
 	// config.HeartbeatTimeout = 50 * time.Millisecond
 	// config.ElectionTimeout = 50 * time.Millisecond
@@ -202,14 +215,20 @@ func (c *Cluster) Start(ctx context.Context) {
 
 	// 5. Initialize the volatile State Machine
 	timeMachine := timefsm.NewMachine()
-	timeActor := gstate.Start(timeMachine, timefsm.TimeMachine{}, timeMachine.WithServiceActivation(false), timeMachine.WithRaiseHandler(func(ctx context.Context, e gstate.RaisedEvent[string, string]) {
-		log.Printf("Machine internal event:%v", e)
-		c.Send(e.Event)
-	}))
+	timeActor := gstate.Start(timeMachine, timefsm.TimeMachine{},
+		timeMachine.WithServiceActivation(false),
+		timeMachine.WithHydrateServices(false),
+		timeMachine.WithRaiseHandler(func(ctx context.Context, e gstate.RaisedEvent[string, string]) {
+			// log.Printf("Machine internal event:%v", e)
+			c.Send(e.Event)
+		}),
+	)
 	fsm := &ClusterFSM{
 		timeMachine: timeMachine,
 		timeActor:   timeActor,
-		stepCh:      make(chan struct{}, 1),
+		send: func(event string) error {
+			return c.Send(event)
+		},
 	}
 
 	// 6. Instantiate Raft Node using pure in-memory parameters
@@ -233,7 +252,7 @@ func (c *Cluster) Start(ctx context.Context) {
 				log.Printf("RaftState:%v", data)
 				if data == raft.Leader {
 					log.Printf("Activating machine")
-					fsm.timeActor.Activate()
+					go fsm.timeActor.Activate()
 				}
 			case raft.LeaderObservation:
 				log.Printf("Leader obs:%v", data.Leader)
@@ -241,6 +260,10 @@ func (c *Cluster) Start(ctx context.Context) {
 				// 	log.Printf("Peer obs:%v", data)
 				// case raft.FailedHeartbeatObservation:
 				// 	log.Printf("FailedHeartbeatObservation obs:%v", data)
+				// if r.State() == raft.Leader {
+				// 	log.Printf("Removing node:%v", data.PeerID)
+				// 	r.RemoveServer(data.PeerID, 0, time.Second*3)
+				// }
 				// case raft.ResumedHeartbeatObservation:
 				// 	log.Printf("ResumedHeartbeatObservation obs:%v", data)
 				// case raft.RequestPreVoteRequest:
@@ -256,6 +279,7 @@ func (c *Cluster) Start(ctx context.Context) {
 		ticker := time.NewTicker(time.Second)
 		for {
 			<-ticker.C
+			log.Printf("Raft state:%+v", r.State())
 
 		}
 
@@ -264,9 +288,9 @@ func (c *Cluster) Start(ctx context.Context) {
 
 }
 
-func (c *Cluster) Send(event string, val ...any) {
+func (c *Cluster) Send(event string, val ...any) error {
 	if c.r.State() != raft.Leader {
-		return
+		return nil
 	}
 	command := Command{
 		Op:    "FIRE",
@@ -275,8 +299,8 @@ func (c *Cluster) Send(event string, val ...any) {
 	payload, err := json.Marshal(command)
 	if err != nil {
 		fmt.Printf("Failed to marshall command. %v : %w", command, err)
-		return
+		return err
 	}
-	log.Printf("Sending event %v", event)
-	c.r.Apply(payload, 2*time.Second)
+	// log.Printf("Sending event %v", event)
+	return c.r.Apply(payload, 2*time.Second).Error()
 }
