@@ -6,6 +6,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"log"
 	"time"
 )
@@ -114,6 +115,9 @@ func (a *Agent) loop(ctx context.Context, w Worker) {
 
 func (a *Agent) report(ctx context.Context, w Worker) {
 	value, err := w.Probe(ctx)
+	if errors.Is(err, ErrNotReady) {
+		return
+	}
 	if err != nil {
 		log.Printf("[%s] probe: %v", w.Name(), err)
 		return
@@ -167,6 +171,9 @@ func (a *Agent) work(ctx context.Context, w Worker, outcomes map[uint64]string) 
 				}
 			}
 			outcomes[o.ID] = outcome
+			// Report what the order changed before reporting its outcome, so
+			// the controller never sees "done" with the state from before.
+			a.report(ctx, w)
 		}
 
 		ev := Event{Name: EvOrderDone, Params: map[string]any{"id": o.ID, "node": a.node}}

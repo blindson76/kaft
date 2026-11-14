@@ -1,14 +1,26 @@
 expected_bootstrap: 3
+mongo:
+  bin: C:\Users\ubozkurt\Downloads\mongodb-windows-x86_64-8.0.9\mongodb-win32-x86_64-windows-8.0.9\bin\mongod.exe
+  # data_dir: defaults to <temp>/kaft-mongo, one sub-directory per node
+  replset: rs0
+  members: 3
+  user: admin
+  password: "123"
+  args: ["--wiredTigerCacheSizeGB", "0.25"]
 nodes:
   - id: node-1
     raft_addr: 127.0.0.1:7001
     http_addr: 127.0.0.1:8001
+    mongo_addr: 127.0.0.1:27001
   - id: node-2
     raft_addr: 127.0.0.1:7002
     http_addr: 127.0.0.1:8002
+    mongo_addr: 127.0.0.1:27002
   - id: node-3
     raft_addr: 127.0.0.1:7003
     http_addr: 127.0.0.1:8003
+    mongo_addr: 127.0.0.1:27003
   - id: node-4
     raft_addr: 127.0.0.1:7004
     http_addr: 127.0.0.1:8004
+    mongo_addr: 127.0.0.1:27004

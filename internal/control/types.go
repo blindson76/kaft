@@ -19,6 +19,7 @@ package control
 import (
 	"context"
 	"encoding/json"
+	"errors"
 
 	"github.com/blindson76/gstate"
 )
@@ -124,6 +125,11 @@ type Host interface {
 	// an invoke) to the raft log. It never blocks; non-leaders drop it.
 	Forward(ev Event)
 }
+
+// ErrNotReady is returned by Worker.Probe while the worker has nothing to
+// report yet, for instance during a slow first inspection. The agent skips the
+// report quietly and asks again.
+var ErrNotReady = errors.New("worker not ready")
 
 // Worker is the node-local counterpart of the controller with the same name.
 type Worker interface {
