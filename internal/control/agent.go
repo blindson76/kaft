@@ -3,6 +3,8 @@ package control
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"log"
 	"time"
@@ -20,8 +22,17 @@ type SubmitFunc func(ctx context.Context, ev Event) error
 //
 // Because it works from state, nothing is lost on a leader change, a restart
 // or a re-bootstrap: whatever is missing is simply sent again.
+//
+// Working from state is only safe once the local replica is current. A node
+// that just (re)started replays the log, and mid-replay it sees orders as
+// pending whose results come later in the same log. So the agent first commits
+// an EvNodeReady event carrying a boot ID unique to this start, and stays idle
+// until it sees that ID in its own replica. The event is appended after
+// everything committed before it, so having applied it proves the replica has
+// applied all of that too.
 type Agent struct {
 	node     string
+	boot     string
 	rt       *Runtime
 	submit   SubmitFunc
 	workers  []Worker
@@ -29,13 +40,54 @@ type Agent struct {
 }
 
 func NewAgent(node string, rt *Runtime, submit SubmitFunc, workers ...Worker) *Agent {
-	return &Agent{node: node, rt: rt, submit: submit, workers: workers, interval: 500 * time.Millisecond}
+	id := make([]byte, 8)
+	_, _ = rand.Read(id)
+	return &Agent{
+		node:     node,
+		boot:     hex.EncodeToString(id),
+		rt:       rt,
+		submit:   submit,
+		workers:  workers,
+		interval: 500 * time.Millisecond,
+	}
 }
 
-// Run starts one loop per worker and returns immediately.
+// Run starts the announce loop and one loop per worker, and returns
+// immediately.
 func (a *Agent) Run(ctx context.Context) {
+	go a.announce(ctx)
 	for _, w := range a.workers {
 		go a.loop(ctx, w)
+	}
+}
+
+// caughtUp reports whether this start's EvNodeReady has been applied locally.
+func (a *Agent) caughtUp() bool {
+	return a.rt.Boot(a.node) == a.boot
+}
+
+// announce keeps submitting EvNodeReady until it is applied locally. It keeps
+// watching afterwards, so the agent re-announces if the replicated state is
+// ever rebuilt without it.
+func (a *Agent) announce(ctx context.Context) {
+	ticker := time.NewTicker(a.interval)
+	defer ticker.Stop()
+
+	wasReady := false
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+		ready := a.caughtUp()
+		if ready && !wasReady {
+			log.Printf("Agent caught up with the log (boot %s); executing orders", a.boot)
+		}
+		wasReady = ready
+		if !ready {
+			_ = a.submit(ctx, Event{Name: EvNodeReady, Params: map[string]any{"node": a.node, "boot": a.boot}})
+		}
 	}
 }
 
@@ -51,6 +103,9 @@ func (a *Agent) loop(ctx context.Context, w Worker) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
+		}
+		if !a.caughtUp() {
+			continue
 		}
 		a.report(ctx, w)
 		a.work(ctx, w, outcomes)

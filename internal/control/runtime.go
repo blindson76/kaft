@@ -15,6 +15,8 @@ type store struct {
 	Seq uint64 `json:"seq"`
 	// Alive is the leader-observed liveness of each node.
 	Alive map[string]bool `json:"alive"`
+	// Boots is the boot ID each node's agent last announced.
+	Boots map[string]string `json:"boots"`
 	// Reports holds the last probe result per controller and node, as
 	// canonical JSON.
 	Reports map[string]map[string]json.RawMessage `json:"reports"`
@@ -25,6 +27,7 @@ type store struct {
 func newStore() store {
 	return store{
 		Alive:   map[string]bool{},
+		Boots:   map[string]string{},
 		Reports: map[string]map[string]json.RawMessage{},
 		Orders:  map[uint64]Order{},
 	}
@@ -80,6 +83,16 @@ func (r *Runtime) Apply(ev Event) {
 	case EvNodeUp, EvNodeDown:
 		r.mu.Lock()
 		r.store.Alive[node] = ev.Name == EvNodeUp
+		r.mu.Unlock()
+		ev.Target = ""
+
+	case EvNodeReady:
+		boot, _ := ev.Params["boot"].(string)
+		if node == "" || boot == "" {
+			return
+		}
+		r.mu.Lock()
+		r.store.Boots[node] = boot
 		r.mu.Unlock()
 		ev.Target = ""
 
@@ -178,6 +191,13 @@ func (r *Runtime) Alive(node string) bool {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	return r.store.Alive[node]
+}
+
+// Boot returns the boot ID last announced by node's agent, or "".
+func (r *Runtime) Boot(node string) string {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.store.Boots[node]
 }
 
 // Report returns the last replicated report of controller for node, or nil.

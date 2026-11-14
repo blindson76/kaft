@@ -29,6 +29,12 @@ const (
 	// observes a liveness change. Params: "node".
 	EvNodeUp   = "node.up"
 	EvNodeDown = "node.down"
+	// EvNodeReady is committed by a node's agent when it starts, and
+	// broadcast to every controller: the node (re)started and its local
+	// services may have lost their state. Params: "node", "boot" (an ID
+	// unique to that start). Applying its own EvNodeReady is also how an
+	// agent knows it has caught up with the log; see Agent.
+	EvNodeReady = "node.ready"
 	// EvReport carries a worker's local probe result to its controller.
 	// Params: "node", "report" (the probe value, JSON-decoded).
 	EvReport = "report"
