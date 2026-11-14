@@ -3,83 +3,52 @@ package internal
 import (
 	"context"
 	"encoding/json"
-	"fmt"
+	"errors"
 	"io"
 	"log"
 	"net"
 	"slices"
 	"time"
 
-	timefsm "example.com/dstate/internal/fsm/time"
+	"example.com/dstate/internal/control"
 	"example.com/dstate/internal/util"
-	"github.com/blindson76/gstate"
 	"github.com/hashicorp/raft"
 )
 
+// ClusterFSM is the raft state machine. All the logic lives in the control
+// runtime; this type only translates between raft and control events.
 type ClusterFSM struct {
-	timeMachine *gstate.Machine[string, string, timefsm.TimeMachine]
-	timeActor   *gstate.Actor[string, string, timefsm.TimeMachine]
-	send        func(string) error
-}
-
-type Command struct {
-	Op    string `json:"op"`
-	Key   string `json:"key"`
-	Value string `json:"value"`
+	rt *control.Runtime
 }
 
 func (fsm *ClusterFSM) Apply(l *raft.Log) interface{} {
-	var cmd Command
-	if err := json.Unmarshal(l.Data, &cmd); err != nil {
+	var ev control.Event
+	if err := json.Unmarshal(l.Data, &ev); err != nil {
 		return err
 	}
-
-	switch cmd.Op {
-	case "FIRE":
-		fsm.timeActor.Send(cmd.Value)
-	default:
-		return fmt.Errorf("unknown operation: %s", cmd.Op)
-	}
-	return fsm.timeActor.Snapshot()
+	fsm.rt.Apply(ev)
+	return nil
 }
 
 func (fsm *ClusterFSM) Snapshot() (raft.FSMSnapshot, error) {
-	snap := fsm.timeActor.Snapshot()
-	// log.Printf("Snapshot machine:%+v", snap)
-	bytes, err := json.Marshal(snap)
+	data, err := fsm.rt.Snapshot()
 	if err != nil {
 		return nil, err
 	}
-	// log.Printf("SNAP:%s", string(bytes))
-	return &ClusterSnapshot{data: bytes}, nil
+	return &ClusterSnapshot{data: data}, nil
 }
 
 func (fsm *ClusterFSM) Restore(rc io.ReadCloser) error {
-	log.Println("Restoring machine")
 	defer rc.Close()
-	var snap gstate.Snapshot[string, timefsm.TimeMachine]
-	if err := json.NewDecoder(rc).Decode(&snap); err != nil {
-		log.Printf("Restoring error:%+v", err)
+	data, err := io.ReadAll(rc)
+	if err != nil {
 		return err
 	}
-
-	if fsm.timeActor != nil {
-		fsm.timeActor.Stop()
+	if err := fsm.rt.Restore(data); err != nil {
+		log.Printf("Restore error:%v", err)
+		return err
 	}
-
-	// Disable automatic invoke/timer restarts on restore to preserve determinism
-	fsm.timeActor = gstate.Hydrate(
-		fsm.timeMachine,
-		snap,
-		fsm.timeMachine.WithServiceActivation(false),
-		fsm.timeMachine.WithInternalViaHandler(true),
-		fsm.timeMachine.WithRaiseHandler(func(ctx context.Context, e gstate.RaisedEvent[string, string]) {
-			// log.Printf("Machine internal event:%v", e)
-			fsm.send(e.Event)
-		}),
-	)
-
-	log.Printf("Restored machine:%+v", fsm.timeActor.Snapshot())
+	log.Println("Restored control state from snapshot")
 	return nil
 }
 
@@ -106,6 +75,8 @@ type Cluster struct {
 	expected  int
 	bsManager *ClusterBootstrapController
 	r         *raft.Raft
+	rt        *control.Runtime
+	workers   []control.Worker
 }
 
 func NewCluster(self string, cfg *ClusterConfig) *Cluster {
@@ -121,11 +92,23 @@ func NewCluster(self string, cfg *ClusterConfig) *Cluster {
 		nodesMap: nodesMap,
 		nodes:    nodes,
 		expected: cfg.ExpectedBootstrap,
+		rt:       control.NewRuntime(),
 	}
 	delayBootstrap := time.Second*3 + time.Duration(slices.Index(nodes, c.nodeID)*int(time.Second))
 	c.bsManager = NewClusterManager(nodes, cfg.ExpectedBootstrap, delayBootstrap, c)
 	return c
 }
+
+// Register adds a controller and its node-local worker. Every node must
+// register the same controllers, before Start. worker may be nil for a
+// controller that needs no local agent.
+func (c *Cluster) Register(controller control.Controller, worker control.Worker) {
+	c.rt.Register(controller)
+	if worker != nil {
+		c.workers = append(c.workers, worker)
+	}
+}
+
 func (c *Cluster) Bootstrap(ctx context.Context, nodes []string) error {
 	log.Printf("Bootstraping cluster with %+v", nodes)
 	servers := make([]raft.Server, 0)
@@ -149,6 +132,7 @@ const (
 	probeTimeout      = 500 * time.Millisecond
 	deadNodeTimeout   = 5 * time.Second
 	membershipTimeout = 5 * time.Second
+	applyTimeout      = 2 * time.Second
 )
 
 // reconcileMembership runs on every node but only acts while this node is the
@@ -158,6 +142,9 @@ const (
 // quorum shrinks with the cluster. Membership never shrinks below `expected`.
 // At most one change is made per tick, since raft applies configuration
 // changes one at a time.
+//
+// The same probes feed the control layer: a liveness change is committed as a
+// node.up / node.down event.
 func (c *Cluster) reconcileMembership(ctx context.Context) {
 	ticker := time.NewTicker(reconcileInterval)
 	defer ticker.Stop()
@@ -184,6 +171,8 @@ func (c *Cluster) reconcileMembership(ctx context.Context) {
 			members[s.ID] = true
 		}
 
+		c.syncLiveness(c.nodeID, true)
+
 		changed := false
 		for _, node := range c.nodes {
 			if node == c.nodeID {
@@ -194,6 +183,7 @@ func (c *Cluster) reconcileMembership(ctx context.Context) {
 
 			if util.ProbeTCP(ctx, addr, probeTimeout) {
 				delete(downSince, id)
+				c.syncLiveness(node, true)
 				if members[id] || changed {
 					continue
 				}
@@ -205,26 +195,44 @@ func (c *Cluster) reconcileMembership(ctx context.Context) {
 				continue
 			}
 
-			if !members[id] {
-				continue
-			}
 			since, ok := downSince[id]
 			if !ok {
 				downSince[id] = time.Now()
 				continue
 			}
-			if changed || time.Since(since) < deadNodeTimeout || len(servers) <= c.expected {
+			if time.Since(since) < deadNodeTimeout {
+				continue
+			}
+			c.syncLiveness(node, false)
+			if !members[id] || changed || len(servers) <= c.expected {
 				continue
 			}
 			log.Printf("Removing lost node %s (unreachable for %v)", node, time.Since(since).Round(time.Second))
 			if err := c.r.RemoveServer(id, 0, membershipTimeout).Error(); err != nil {
 				log.Printf("Remove server error:%v", err)
 			}
-			delete(downSince, id)
 			changed = true
 		}
 	}
 }
+
+// syncLiveness commits a node.up / node.down event when the observed liveness
+// of node differs from the replicated one. Comparing against replicated state
+// keeps it correct across leader changes.
+func (c *Cluster) syncLiveness(node string, up bool) {
+	if c.rt.Alive(node) == up {
+		return
+	}
+	name := control.EvNodeDown
+	if up {
+		name = control.EvNodeUp
+	}
+	log.Printf("Liveness: %s %s", node, name)
+	if err := c.apply(control.Event{Name: name, Params: map[string]any{"node": node}}); err != nil {
+		log.Printf("Liveness event error:%v", err)
+	}
+}
+
 func (c *Cluster) WaitNode(ctx context.Context, node string) {
 	util.WaitTCP(ctx, c.nodesMap[node].RaftAddr, 2*time.Second)
 	log.Println("Node ready", node)
@@ -266,23 +274,8 @@ func (c *Cluster) Start(ctx context.Context) {
 		log.Fatalf("failed to build network transport: %v", err)
 	}
 
-	// 5. Initialize the volatile State Machine
-	timeMachine := timefsm.NewMachine()
-	timeActor := gstate.Start(timeMachine, timefsm.TimeMachine{},
-		timeMachine.WithServiceActivation(false),
-		timeMachine.WithInternalViaHandler(true),
-		timeMachine.WithRaiseHandler(func(ctx context.Context, e gstate.RaisedEvent[string, string]) {
-			// log.Printf("Machine internal event:%v", e)
-			c.Send(e.Event)
-		}),
-	)
-	fsm := &ClusterFSM{
-		timeMachine: timeMachine,
-		timeActor:   timeActor,
-		send: func(event string) error {
-			return c.Send(event)
-		},
-	}
+	// 5. The state machine is the control runtime with its registered controllers
+	fsm := &ClusterFSM{rt: c.rt}
 
 	// 6. Instantiate Raft Node using pure in-memory parameters
 	r, err := raft.NewRaft(config, fsm, memStore, memStore, snapshotStore, transport)
@@ -304,8 +297,8 @@ func (c *Cluster) Start(ctx context.Context) {
 			case raft.RaftState:
 				log.Printf("RaftState:%v", data)
 				if data == raft.Leader {
-					log.Printf("Activating machine")
-					go fsm.timeActor.Activate()
+					log.Printf("Activating controllers")
+					go c.rt.Activate()
 				}
 			case raft.LeaderObservation:
 				log.Printf("Leader obs:%v", data.Leader)
@@ -328,23 +321,54 @@ func (c *Cluster) Start(ctx context.Context) {
 		}
 	}()
 	go c.reconcileMembership(ctx)
+	go c.forwardRaised(ctx)
+	go c.serveHTTP(ctx)
+	control.NewAgent(nodeID, c.rt, c.Submit, c.workers...).Run(ctx)
 	c.bsManager.Start(ctx)
 
 }
 
-func (c *Cluster) Send(event string, val ...any) error {
-	if c.r.State() != raft.Leader {
-		return nil
+// forwardRaised commits the events controllers raised outside the committed
+// stream (timers, invokes). Every replica raises them; only the leader's copy
+// reaches the log.
+func (c *Cluster) forwardRaised(ctx context.Context) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case ev := <-c.rt.Outbox():
+			if c.r.State() != raft.Leader {
+				continue
+			}
+			if err := c.apply(ev); err != nil {
+				log.Printf("Raised event %s/%s not committed: %v", ev.Target, ev.Name, err)
+			}
+		}
 	}
-	command := Command{
-		Op:    "FIRE",
-		Value: event,
-	}
-	payload, err := json.Marshal(command)
+}
+
+var ErrNoLeader = errors.New("no raft leader")
+
+// apply commits ev through the local raft node; it fails unless this node is
+// the leader.
+func (c *Cluster) apply(ev control.Event) error {
+	payload, err := json.Marshal(ev)
 	if err != nil {
-		fmt.Printf("Failed to marshall command. %v : %w", command, err)
 		return err
 	}
-	// log.Printf("Sending event %v", event)
-	return c.r.Apply(payload, 2*time.Second).Error()
+	return c.r.Apply(payload, applyTimeout).Error()
+}
+
+// Submit commits ev from any node: directly when this node is the leader,
+// otherwise by handing it to the leader over HTTP.
+func (c *Cluster) Submit(ctx context.Context, ev control.Event) error {
+	if c.r.State() == raft.Leader {
+		return c.apply(ev)
+	}
+	_, leader := c.r.LeaderWithID()
+	node, ok := c.nodesMap[string(leader)]
+	if !ok {
+		return ErrNoLeader
+	}
+	return postEvent(ctx, node.HTTPAddr, ev)
 }
