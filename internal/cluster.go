@@ -144,31 +144,84 @@ func (c *Cluster) Bootstrap(ctx context.Context, nodes []string) error {
 
 }
 
-func (c *Cluster) Join(ctx context.Context, node string) {
-	addr := raft.ServerAddress(c.nodesMap[node].RaftAddr)
-	ticker := time.NewTicker(time.Second)
+const (
+	reconcileInterval = time.Second
+	probeTimeout      = 500 * time.Millisecond
+	deadNodeTimeout   = 5 * time.Second
+	membershipTimeout = 5 * time.Second
+)
+
+// reconcileMembership runs on every node but only acts while this node is the
+// raft leader. Each tick it compares the raft configuration with what is
+// actually reachable: configured nodes that are up but not members are added
+// as voters, and members unreachable for deadNodeTimeout are removed so the
+// quorum shrinks with the cluster. Membership never shrinks below `expected`.
+// At most one change is made per tick, since raft applies configuration
+// changes one at a time.
+func (c *Cluster) reconcileMembership(ctx context.Context) {
+	ticker := time.NewTicker(reconcileInterval)
 	defer ticker.Stop()
+
+	downSince := map[raft.ServerID]time.Time{}
 	for {
-		if c.r.State() == raft.Leader {
-			cf := c.r.GetConfiguration()
-			if err := cf.Error(); err == nil {
-				for _, s := range cf.Configuration().Servers {
-					if s.ID == raft.ServerID(node) {
-						return
-					}
-				}
-				log.Println("Adding new node", node)
-				if err := c.r.AddVoter(raft.ServerID(node), addr, 0, 10*time.Second).Error(); err != nil {
-					log.Printf("Add voter error:%v", err)
-				} else {
-					return
-				}
-			}
-		}
 		select {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
+		}
+
+		if c.r.State() != raft.Leader {
+			clear(downSince)
+			continue
+		}
+		cf := c.r.GetConfiguration()
+		if err := cf.Error(); err != nil {
+			continue
+		}
+		servers := cf.Configuration().Servers
+		members := make(map[raft.ServerID]bool, len(servers))
+		for _, s := range servers {
+			members[s.ID] = true
+		}
+
+		changed := false
+		for _, node := range c.nodes {
+			if node == c.nodeID {
+				continue
+			}
+			id := raft.ServerID(node)
+			addr := c.nodesMap[node].RaftAddr
+
+			if util.ProbeTCP(ctx, addr, probeTimeout) {
+				delete(downSince, id)
+				if members[id] || changed {
+					continue
+				}
+				log.Println("Adding node", node)
+				if err := c.r.AddVoter(id, raft.ServerAddress(addr), 0, membershipTimeout).Error(); err != nil {
+					log.Printf("Add voter error:%v", err)
+				}
+				changed = true
+				continue
+			}
+
+			if !members[id] {
+				continue
+			}
+			since, ok := downSince[id]
+			if !ok {
+				downSince[id] = time.Now()
+				continue
+			}
+			if changed || time.Since(since) < deadNodeTimeout || len(servers) <= c.expected {
+				continue
+			}
+			log.Printf("Removing lost node %s (unreachable for %v)", node, time.Since(since).Round(time.Second))
+			if err := c.r.RemoveServer(id, 0, membershipTimeout).Error(); err != nil {
+				log.Printf("Remove server error:%v", err)
+			}
+			delete(downSince, id)
+			changed = true
 		}
 	}
 }
@@ -185,6 +238,8 @@ func (c *Cluster) Start(ctx context.Context) {
 	config := raft.DefaultConfig()
 	config.LocalID = raft.ServerID(nodeID)
 	config.LogOutput = io.Discard
+	// A removed node must keep running so it can be re-added once reachable.
+	config.ShutdownOnRemove = false
 
 	config.SnapshotInterval = time.Millisecond * 400
 	config.SnapshotThreshold = 5
@@ -272,15 +327,7 @@ func (c *Cluster) Start(ctx context.Context) {
 
 		}
 	}()
-	go func() {
-
-		ticker := time.NewTicker(time.Second)
-		for {
-			<-ticker.C
-
-		}
-
-	}()
+	go c.reconcileMembership(ctx)
 	c.bsManager.Start(ctx)
 
 }

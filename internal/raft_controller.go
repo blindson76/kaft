@@ -9,7 +9,6 @@ import (
 
 type ClusterManager interface {
 	Bootstrap(context.Context, []string) error
-	Join(context.Context, string)
 	WaitNode(context.Context, string)
 }
 
@@ -91,9 +90,9 @@ func (rc *ClusterBootstrapController) Start(ctx context.Context) error {
 						return err
 					}
 				}
-			} else if len(activeNodes) > rc.expected {
-				go rc.c.Join(ctx, node)
 			}
+			// Nodes beyond the bootstrap set are added by the leader's
+			// membership reconciliation.
 		}
 	}
 }
