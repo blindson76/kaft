@@ -72,7 +72,6 @@ func (fsm *ClusterFSM) Restore(rc io.ReadCloser) error {
 	fsm.timeActor = gstate.Hydrate(
 		fsm.timeMachine,
 		snap,
-		fsm.timeMachine.WithHydrateServices(false),
 		fsm.timeMachine.WithServiceActivation(false),
 		fsm.timeMachine.WithRaiseHandler(func(ctx context.Context, e gstate.RaisedEvent[string, string]) {
 			// log.Printf("Machine internal event:%v", e)
@@ -217,7 +216,6 @@ func (c *Cluster) Start(ctx context.Context) {
 	timeMachine := timefsm.NewMachine()
 	timeActor := gstate.Start(timeMachine, timefsm.TimeMachine{},
 		timeMachine.WithServiceActivation(false),
-		timeMachine.WithHydrateServices(false),
 		timeMachine.WithRaiseHandler(func(ctx context.Context, e gstate.RaisedEvent[string, string]) {
 			// log.Printf("Machine internal event:%v", e)
 			c.Send(e.Event)
