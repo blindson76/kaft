@@ -19,7 +19,6 @@ import (
 type ClusterFSM struct {
 	timeMachine *gstate.Machine[string, string, timefsm.TimeMachine]
 	timeActor   *gstate.Actor[string, string, timefsm.TimeMachine]
-	stepCh      chan struct{}
 	send        func(string) error
 }
 
@@ -73,6 +72,7 @@ func (fsm *ClusterFSM) Restore(rc io.ReadCloser) error {
 		fsm.timeMachine,
 		snap,
 		fsm.timeMachine.WithServiceActivation(false),
+		fsm.timeMachine.WithInternalViaHandler(true),
 		fsm.timeMachine.WithRaiseHandler(func(ctx context.Context, e gstate.RaisedEvent[string, string]) {
 			// log.Printf("Machine internal event:%v", e)
 			fsm.send(e.Event)
@@ -137,7 +137,6 @@ func (c *Cluster) Bootstrap(ctx context.Context, nodes []string) error {
 	}
 
 	err := c.r.BootstrapCluster(raft.Configuration{
-
 		Servers: servers,
 	}).Error()
 	log.Printf("Bootstrap resutl:%v", err)
@@ -216,6 +215,7 @@ func (c *Cluster) Start(ctx context.Context) {
 	timeMachine := timefsm.NewMachine()
 	timeActor := gstate.Start(timeMachine, timefsm.TimeMachine{},
 		timeMachine.WithServiceActivation(false),
+		timeMachine.WithInternalViaHandler(true),
 		timeMachine.WithRaiseHandler(func(ctx context.Context, e gstate.RaisedEvent[string, string]) {
 			// log.Printf("Machine internal event:%v", e)
 			c.Send(e.Event)
@@ -277,7 +277,6 @@ func (c *Cluster) Start(ctx context.Context) {
 		ticker := time.NewTicker(time.Second)
 		for {
 			<-ticker.C
-			log.Printf("Raft state:%+v", r.State())
 
 		}
 

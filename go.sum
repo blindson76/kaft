@@ -4,6 +4,12 @@ github.com/blindson76/gstate v0.0.0-20261112150914-e8a6957bd403 h1:/qmRheQMt2Hos
 github.com/blindson76/gstate v0.0.0-20261112150914-e8a6957bd403/go.mod h1:J981WvccOG3uUfkmWU3iAVx4CwLvTK2B7DjNhDVhbGI=
 github.com/blindson76/gstate v0.0.0-20261113043236-8ddfb949dd95 h1:ReD3eWmy5rxaGvNjTk6xpI2tnCbYX6nxofYjDY8oxqA=
 github.com/blindson76/gstate v0.0.0-20261113043236-8ddfb949dd95/go.mod h1:J981WvccOG3uUfkmWU3iAVx4CwLvTK2B7DjNhDVhbGI=
+github.com/blindson76/gstate v0.0.0-20261114123003-d23a092ec38e h1:AKwD9dQxyhs/Xm0xZ9WJ27Abjon8H4a0sqZl9CENc2M=
+github.com/blindson76/gstate v0.0.0-20261114123003-d23a092ec38e/go.mod h1:J981WvccOG3uUfkmWU3iAVx4CwLvTK2B7DjNhDVhbGI=
+github.com/blindson76/gstate v0.0.0-20261114123906-1eda2f729431 h1:pPa9l1E4rjUBlXdxB1xXok2nqunE86PUbv9qv3GeqGI=
+github.com/blindson76/gstate v0.0.0-20261114123906-1eda2f729431/go.mod h1:J981WvccOG3uUfkmWU3iAVx4CwLvTK2B7DjNhDVhbGI=
+github.com/blindson76/gstate v0.0.0-20261114125255-578223d90f49 h1:4Qsptylv9WEMQJl0FHNhHH3HNAy95i6jHnDUnKfBxkY=
+github.com/blindson76/gstate v0.0.0-20261114125255-578223d90f49/go.mod h1:J981WvccOG3uUfkmWU3iAVx4CwLvTK2B7DjNhDVhbGI=
 github.com/davecgh/go-spew v1.1.0/go.mod h1:J7Y8YcW2NihsgmVo/mv3lAwl/skON4iLHjSsI+c5H38=
 github.com/davecgh/go-spew v1.1.1/go.mod h1:J7Y8YcW2NihsgmVo/mv3lAwl/skON4iLHjSsI+c5H38=
 github.com/fatih/color v1.13.0 h1:8LOYc1KYPPmyKMuN8QV2DNRWNbLo6LZ0iLs8+mlH53w=
