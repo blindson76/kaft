@@ -1,0 +1,290 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>kaft</title>
+<style>
+  :root {
+    --bg: #f5f6f8; --panel: #ffffff; --line: #dfe3e8; --text: #1c2430; --muted: #66727f;
+    --accent: #1f6feb; --accent-text: #ffffff; --ok: #1a7f37; --bad: #cf222e; --warn: #9a6700;
+    --chip: #eef1f4; --flash: #fff3bf;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #0f1318; --panel: #171c23; --line: #2a323c; --text: #e3e8ee; --muted: #8b96a3;
+      --accent: #4c8dff; --accent-text: #0b0f14; --ok: #3fb950; --bad: #f85149; --warn: #d29922;
+      --chip: #212831; --flash: #4a3f12;
+    }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text); font: 14px/1.45 system-ui, "Segoe UI", sans-serif; }
+  header { display: flex; flex-wrap: wrap; align-items: center; gap: 10px 18px; padding: 12px 20px;
+           background: var(--panel); border-bottom: 1px solid var(--line); position: sticky; top: 0; z-index: 2; }
+  header h1 { font-size: 16px; margin: 0; letter-spacing: .02em; }
+  .kv { color: var(--muted); } .kv b { color: var(--text); font-weight: 600; }
+  .dot { display: inline-block; width: 9px; height: 9px; border-radius: 50%; background: var(--muted); margin-right: 6px; }
+  .dot.ok { background: var(--ok); } .dot.bad { background: var(--bad); }
+  main { padding: 16px 20px 40px; display: grid; gap: 16px; max-width: 1500px; margin: 0 auto; }
+  section { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 14px 16px; min-width: 0; }
+  section > h2 { font-size: 13px; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); margin: 0 0 10px; }
+  .row { display: grid; gap: 16px; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); }
+  .chips { display: flex; flex-wrap: wrap; gap: 8px; }
+  .chip { background: var(--chip); border: 1px solid var(--line); border-radius: 6px; padding: 6px 10px;
+          color: inherit; text-decoration: none; display: inline-flex; align-items: center; gap: 6px; }
+  a.chip:hover { border-color: var(--accent); }
+  .chip.self { border-color: var(--accent); }
+  .tag { font-size: 11px; padding: 1px 6px; border-radius: 10px; background: var(--line); color: var(--muted); }
+  .tag.leader { background: var(--accent); color: var(--accent-text); }
+  table { border-collapse: collapse; width: 100%; }
+  th, td { text-align: left; padding: 5px 10px 5px 0; border-bottom: 1px solid var(--line); vertical-align: top; }
+  th { color: var(--muted); font-weight: 500; font-size: 12px; }
+  td.mono, .mono { font-family: ui-monospace, Consolas, monospace; font-size: 12.5px; word-break: break-word; }
+  .empty { color: var(--muted); }
+  .ctl-head { display: flex; align-items: baseline; gap: 12px; margin-bottom: 10px; flex-wrap: wrap; }
+  .ctl-head h3 { margin: 0; font-size: 18px; }
+  .state { background: var(--accent); color: var(--accent-text); border-radius: 6px; padding: 2px 10px; font-weight: 600; }
+  .state.flash { animation: flash 1.2s ease-out; }
+  @keyframes flash { 0% { box-shadow: 0 0 0 8px var(--flash); } 100% { box-shadow: 0 0 0 0 transparent; } }
+  .ctl-body { display: grid; gap: 16px; grid-template-columns: minmax(0, 3fr) minmax(260px, 2fr); }
+  @media (max-width: 900px) { .ctl-body { grid-template-columns: 1fr; } }
+  .diagram { overflow: auto; border: 1px solid var(--line); border-radius: 6px; padding: 8px; min-height: 120px; text-align: center; }
+  .diagram svg { max-width: 100%; height: auto; }
+  .diagram .node.active > :is(rect, path, polygon, circle, ellipse) { fill: var(--accent) !important; stroke: var(--accent) !important; stroke-width: 3px !important; }
+  .diagram .node.active .nodeLabel, .diagram .node.active text { color: var(--accent-text) !important; fill: var(--accent-text) !important; }
+  .pills { display: flex; flex-wrap: wrap; gap: 8px; justify-content: center; padding: 16px 0; }
+  .pill { border: 1px solid var(--line); border-radius: 16px; padding: 4px 14px; }
+  .pill.active { background: var(--accent); color: var(--accent-text); border-color: var(--accent); font-weight: 600; }
+  .side h4 { margin: 0 0 6px; font-size: 12px; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); }
+  .side > div + h4 { margin-top: 14px; }
+  .tree details { margin-left: 14px; } .tree > details { margin-left: 0; }
+  .tree summary { cursor: pointer; } .tree .leaf { margin-left: 14px; }
+  .tree .k { color: var(--muted); }
+  .hist div { display: flex; gap: 10px; } .hist time { color: var(--muted); }
+  .note { color: var(--muted); font-size: 12px; margin-top: 6px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>kaft</h1>
+  <span class="kv">node <b id="h-node">–</b></span>
+  <span class="kv">raft <b id="h-raft">–</b></span>
+  <span class="kv">leader <b id="h-leader">–</b></span>
+  <span class="kv" style="margin-left:auto"><span class="dot" id="h-dot"></span><span id="h-conn">connecting…</span></span>
+</header>
+<main>
+  <div class="row">
+    <section><h2>Nodes</h2><div class="chips" id="nodes"></div>
+      <div class="note">Dot: liveness as replicated. Each node serves its own replica; open another to compare.</div></section>
+    <section><h2>Pending orders</h2><div id="orders"></div></section>
+  </div>
+  <div id="controllers" style="display:grid; gap:16px"></div>
+</main>
+
+<script type="module">
+const $ = (id) => document.getElementById(id);
+const el = (tag, cls, text) => { const e = document.createElement(tag); if (cls) e.className = cls; if (text != null) e.textContent = text; return e; };
+
+// --- Mermaid (optional) ------------------------------------------------------
+// The diagram needs mermaid.js from a CDN. It loads in the background: the
+// page connects and shows the states as a row of pills right away, and swaps
+// in the diagram if and when the library arrives. Offline, the pills stay.
+const mermaidReady = Promise.race([
+  import('https://cdn.jsdelivr.net/npm/mermaid@11.4.1/dist/mermaid.esm.min.mjs').then((m) => {
+    const dark = matchMedia('(prefers-color-scheme: dark)').matches;
+    m.default.initialize({ startOnLoad: false, theme: dark ? 'dark' : 'neutral', flowchart: { curve: 'basis', htmlLabels: true } });
+    return m.default;
+  }),
+  new Promise((resolve) => setTimeout(() => resolve(null), 15000)),
+]).catch(() => null);
+
+// mermaidID mirrors how gstate names nodes: plain identifiers are kept, any
+// other state ID is hex-encoded.
+const reserved = new Set(['end','subgraph','graph','flowchart','direction','style','classDef','class','click','linkStyle','default','accTitle','accDescr','TB','TD','BT','LR','RL']);
+function mermaidID(state) {
+  if (/^[A-Za-z_][A-Za-z0-9_]*$/.test(state) && !state.startsWith('__gstate_') && !reserved.has(state)) return state;
+  return '__gstate_state_' + [...new TextEncoder().encode(state)].map(b => b.toString(16).padStart(2, '0')).join('');
+}
+
+// simplify makes the exported flowchart readable at a glance: transitions that
+// stay in their state are dropped, and parallel arrows between the same two
+// states become one arrow listing the distinct triggers.
+function simplify(src) {
+  let lines = src.split('\n');
+  if (lines[0].trim() === '---') lines = lines.slice(lines.indexOf('---', 1) + 1);
+  const out = [], edges = new Map(), states = [];
+  for (const line of lines) {
+    const edge = line.match(/^\s*(\S+) -->\|"(.*)"\| (\S+)\s*$/);
+    if (!edge) {
+      const node = line.match(/^\s*(\S+)\(\["(.*)"\]\)\s*$/);
+      if (node) states.push({ id: node[1], label: node[2] });
+      if (line.trim()) out.push(line);
+      continue;
+    }
+    const [, from, label, to] = edge;
+    if (from === to) continue;
+    const trigger = label.split(' / ')[0].replace(/\s*\[guard\]/, '').replace(/^after (\d+)ms$/, (_, ms) => 'after ' + ms / 1000 + 's');
+    const key = from + ' ' + to;
+    if (!edges.has(key)) edges.set(key, { from, to, triggers: [] });
+    if (!edges.get(key).triggers.includes(trigger)) edges.get(key).triggers.push(trigger);
+  }
+  for (const e of edges.values()) out.push(`    ${e.from} -->|"${e.triggers.join('<br/>')}"| ${e.to}`);
+  return { text: out.join('\n'), states };
+}
+
+// --- Rendering ---------------------------------------------------------------
+const cards = new Map(); // controller name -> card state
+let hello = null;
+
+function buildCard(diagram, index) {
+  const { text, states } = simplify(diagram.mermaid);
+  const card = { name: diagram.name, states, active: null, activeStates: [], svg: false, history: [], open: new Set() };
+
+  const sec = el('section');
+  const head = el('div', 'ctl-head');
+  head.append(el('h3', null, diagram.name), card.badge = el('span', 'state', '–'));
+  const body = el('div', 'ctl-body');
+  card.diagram = el('div', 'diagram');
+  const side = el('div', 'side');
+  side.append(el('h4', null, 'Data'), card.data = el('div', 'tree mono'), el('h4', null, 'State changes'), card.hist = el('div', 'hist mono'));
+  body.append(card.diagram, side);
+  sec.append(head, body);
+  $('controllers').append(sec);
+
+  const pills = el('div', 'pills');
+  for (const s of states) { const p = el('span', 'pill', s.label); p.dataset.state = s.id; pills.append(p); }
+  const note = el('div', 'note', 'Loading diagram…');
+  card.diagram.replaceChildren(pills, note);
+  cards.set(diagram.name, card);
+
+  mermaidReady.then(async (mermaid) => {
+    if (!mermaid) throw new Error('mermaid.js not available');
+    card.diagram.innerHTML = (await mermaid.render('diagram' + index, text)).svg;
+    card.svg = true;
+    highlight(card);
+  }).catch(() => { note.textContent = 'Diagram unavailable (mermaid.js could not be loaded); showing states only.'; });
+}
+
+// highlight marks the card's active states in whichever form is on screen.
+function highlight(card) {
+  card.diagram.querySelectorAll('.active').forEach(n => n.classList.remove('active'));
+  for (const state of card.activeStates) {
+    const id = mermaidID(state);
+    const node = card.svg
+      ? card.diagram.querySelector(`g.node[id$="flowchart-${id}-0"], g.node[id*="flowchart-${id}-"]`)
+      : card.diagram.querySelector(`.pill[data-state="${id}"]`);
+    if (node) node.classList.add('active');
+  }
+}
+
+// tree renders a JSON value as nested, collapsible rows. Which rows are open
+// is remembered per controller, so a repaint does not fold them back.
+function tree(value, path, open, depth) {
+  const frag = document.createDocumentFragment();
+  for (const [k, v] of Object.entries(value ?? {})) {
+    const p = path + '/' + k;
+    const nested = v !== null && typeof v === 'object' && Object.keys(v).length > 0;
+    if (!nested) {
+      const row = el('div', 'leaf');
+      row.append(el('span', 'k', k + ': '), document.createTextNode(v !== null && typeof v === 'object' ? (Array.isArray(v) ? '[]' : '{}') : JSON.stringify(v)));
+      frag.append(row);
+      continue;
+    }
+    const d = el('details');
+    d.open = open.has(p) || (depth === 0 && !open.has('!' + p) && Array.isArray(v));
+    const summary = el('summary');
+    const brief = Array.isArray(v) && v.every(x => typeof x !== 'object') ? JSON.stringify(v) : (Array.isArray(v) ? `[${v.length}]` : `{${Object.keys(v).length}}`);
+    summary.append(el('span', 'k', k + ' '), document.createTextNode(brief));
+    d.append(summary);
+    d.addEventListener('toggle', () => { if (d.open) { open.add(p); open.delete('!' + p); } else { open.delete(p); open.add('!' + p); } });
+    d.append(tree(v, p, open, depth + 1));
+    frag.append(d);
+  }
+  return frag;
+}
+
+function render(state) {
+  $('h-raft').textContent = state.raft;
+  $('h-leader').textContent = state.leader || 'none';
+
+  const snap = state.control.snapshot ?? {};
+  const store = snap.store ?? {};
+
+  const nodes = $('nodes');
+  nodes.replaceChildren();
+  for (const n of hello.nodes) {
+    const self = n.id === hello.node;
+    const chip = el(self ? 'span' : 'a', 'chip' + (self ? ' self' : ''));
+    if (!self) { chip.href = 'http://' + n.http + '/'; chip.title = 'Open the view served by ' + n.id; }
+    const alive = (store.alive ?? {})[n.id];
+    chip.append(el('span', 'dot ' + (alive ? 'ok' : alive === false ? 'bad' : '')), document.createTextNode(n.id));
+    if (n.id === state.leader) chip.append(el('span', 'tag leader', 'leader'));
+    if (!state.members.includes(n.id)) chip.append(el('span', 'tag', 'not in raft'));
+    nodes.append(chip);
+  }
+
+  const orders = Object.values(store.orders ?? {}).sort((a, b) => a.id - b.id);
+  if (orders.length === 0) {
+    $('orders').replaceChildren(el('div', 'empty', 'None. Every order has been carried out.'));
+  } else {
+    const table = el('table');
+    table.innerHTML = '<tr><th>#</th><th>Controller</th><th>Node</th><th>Order</th><th>Arguments</th></tr>';
+    for (const o of orders) {
+      const tr = el('tr');
+      tr.append(el('td', 'mono', o.id), el('td', null, o.controller), el('td', null, o.node), el('td', 'mono', o.kind), el('td', 'mono', o.args ? JSON.stringify(o.args) : ''));
+      table.append(tr);
+    }
+    $('orders').replaceChildren(table);
+  }
+
+  for (const [name, card] of cards) {
+    const ctl = (snap.controllers ?? {})[name] ?? {};
+    const active = (ctl.active ?? []).join(' / ') || '–';
+    if (active !== card.active) {
+      if (card.active !== null) {
+        card.history.unshift({ at: new Date(), from: card.active, to: active });
+        card.history.length = Math.min(card.history.length, 15);
+        card.badge.classList.remove('flash'); void card.badge.offsetWidth; card.badge.classList.add('flash');
+      }
+      card.active = active;
+      card.badge.textContent = active;
+      card.activeStates = ctl.active ?? [];
+      highlight(card);
+    }
+    card.data.replaceChildren(tree(ctl.data, '', card.open, 0));
+    if (card.history.length === 0) {
+      card.hist.replaceChildren(el('div', 'empty', 'None since this page was opened.'));
+    } else {
+      card.hist.replaceChildren(...card.history.map(h => {
+        const row = el('div');
+        row.append(el('time', null, h.at.toLocaleTimeString()), document.createTextNode(`${h.from} → ${h.to}`));
+        return row;
+      }));
+    }
+  }
+}
+
+// --- Connection --------------------------------------------------------------
+function status(ok, text) { $('h-dot').className = 'dot ' + (ok ? 'ok' : 'bad'); $('h-conn').textContent = text; }
+
+function connect() {
+  const ws = new WebSocket((location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + '/ws');
+  ws.onopen = () => status(true, 'live');
+  ws.onmessage = (m) => {
+    const msg = JSON.parse(m.data);
+    if (msg.type === 'hello') {
+      const first = hello === null;
+      hello = msg;
+      $('h-node').textContent = msg.node;
+      document.title = 'kaft · ' + msg.node;
+      if (first) msg.controllers.forEach(buildCard);
+    } else if (msg.type === 'state' && hello) {
+      render(msg);
+    }
+  };
+  ws.onclose = () => { status(false, 'disconnected, retrying…'); setTimeout(connect, 1500); };
+}
+connect();
+</script>
+</body>
+</html>

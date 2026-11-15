@@ -42,6 +42,8 @@ func postEvent(ctx context.Context, addr string, ev control.Event) error {
 //
 //	POST /event  commit an event (leader only; followers answer 503)
 //	GET  /state  raft and control state of this node, for inspection
+//	GET  /       live view of the state machines (see web.go)
+//	GET  /ws     WebSocket feed behind that view
 func (c *Cluster) serveHTTP(ctx context.Context) {
 	mux := http.NewServeMux()
 
@@ -82,6 +84,12 @@ func (c *Cluster) serveHTTP(ctx context.Context) {
 			"control": c.rt.Inspect(),
 		})
 	})
+
+	mux.HandleFunc("GET /{$}", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		_, _ = w.Write(uiHTML)
+	})
+	mux.HandleFunc("GET /ws", c.serveWS)
 
 	srv := &http.Server{Addr: c.nodesMap[c.nodeID].HTTPAddr, Handler: mux}
 	go func() {

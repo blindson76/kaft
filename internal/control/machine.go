@@ -144,6 +144,10 @@ func (m *machine[D]) Restore(raw json.RawMessage) error {
 	return nil
 }
 
+func (m *machine[D]) Diagram() string {
+	return gstate.ToMermaid(m.def)
+}
+
 func (m *machine[D]) States() []string {
 	return m.current().States()
 }

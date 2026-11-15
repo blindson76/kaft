@@ -4,6 +4,7 @@ go 1.27.0
 
 require (
 	github.com/blindson76/gstate v0.0.0-20261114125255-578223d90f49
+	github.com/coder/websocket v1.8.15
 	github.com/hashicorp/raft v1.8.0
 	go.mongodb.org/mongo-driver/v2 v2.10.0
 	gopkg.in/yaml.v3 v3.0.1

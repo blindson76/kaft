@@ -111,6 +111,9 @@ type Controller interface {
 	Restore(json.RawMessage) error
 	// States lists the active states, for inspection.
 	States() []string
+	// Diagram returns the state machine as a Mermaid flowchart, for the web
+	// view. It never changes.
+	Diagram() string
 }
 
 // Host is what the Runtime offers to a Controller.

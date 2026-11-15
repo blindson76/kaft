@@ -48,6 +48,10 @@ type Runtime struct {
 	controllers []Controller
 	byName      map[string]Controller
 	outbox      chan Event
+
+	// subs are the listeners told whenever the replicated state changed.
+	subMu sync.Mutex
+	subs  map[chan struct{}]struct{}
 }
 
 func NewRuntime() *Runtime {
@@ -55,6 +59,7 @@ func NewRuntime() *Runtime {
 		store:  newStore(),
 		byName: map[string]Controller{},
 		outbox: make(chan Event, 1024),
+		subs:   map[chan struct{}]struct{}{},
 	}
 }
 
@@ -75,6 +80,7 @@ func (r *Runtime) Register(c Controller) {
 // consistent with the log position.
 func (r *Runtime) Apply(ev Event) {
 	r.applyMu.Lock()
+	defer r.notify()
 	defer r.applyMu.Unlock()
 
 	node, _ := ev.Params["node"].(string)
@@ -249,6 +255,7 @@ func (r *Runtime) Snapshot() ([]byte, error) {
 // Restore replaces the store and every controller's state.
 func (r *Runtime) Restore(data []byte) error {
 	r.applyMu.Lock()
+	defer r.notify()
 	defer r.applyMu.Unlock()
 
 	snap := snapshot{Store: newStore()}
@@ -287,4 +294,47 @@ func (r *Runtime) Inspect() any {
 		states[c.Name()] = c.States()
 	}
 	return map[string]any{"states": states, "snapshot": json.RawMessage(snap)}
+}
+
+// Subscribe returns a channel that receives a signal whenever the replicated
+// state may have changed, and a function to stop listening. Signals are
+// coalesced: one pending signal stands for any number of changes, so the
+// listener reads the current state (Inspect) rather than counting events.
+func (r *Runtime) Subscribe() (<-chan struct{}, func()) {
+	ch := make(chan struct{}, 1)
+	r.subMu.Lock()
+	r.subs[ch] = struct{}{}
+	r.subMu.Unlock()
+	return ch, func() {
+		r.subMu.Lock()
+		delete(r.subs, ch)
+		r.subMu.Unlock()
+	}
+}
+
+func (r *Runtime) notify() {
+	r.subMu.Lock()
+	defer r.subMu.Unlock()
+	for ch := range r.subs {
+		select {
+		case ch <- struct{}{}:
+		default:
+		}
+	}
+}
+
+// Diagrams returns each controller's state machine as a Mermaid flowchart, in
+// registration order.
+func (r *Runtime) Diagrams() []Diagram {
+	out := make([]Diagram, 0, len(r.controllers))
+	for _, c := range r.controllers {
+		out = append(out, Diagram{Name: c.Name(), Mermaid: c.Diagram()})
+	}
+	return out
+}
+
+// Diagram is one controller's state machine drawing.
+type Diagram struct {
+	Name    string `json:"name"`
+	Mermaid string `json:"mermaid"`
 }
