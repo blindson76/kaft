@@ -14,6 +14,29 @@ type NodeConfig struct {
 	// MongoAddr is the host:port the node's mongod serves replica set
 	// traffic on; it is also the member host in the replica set config.
 	MongoAddr string `yaml:"mongo_addr"`
+	// KafkaID is the node's Kafka node.id. KafkaAddr and KafkaControllerAddr
+	// are the host:port of its broker and controller listeners.
+	KafkaID             int    `yaml:"kafka_id"`
+	KafkaAddr           string `yaml:"kafka_addr"`
+	KafkaControllerAddr string `yaml:"kafka_controller_addr"`
+}
+
+// KafkaConfig configures the kafka controller and its workers. The controller
+// is enabled when Home is set.
+type KafkaConfig struct {
+	// Home is the Kafka installation directory (the one holding libs/ and
+	// config/). Kafka 3.9 or newer: the controller quorum is dynamic.
+	Home string `yaml:"home"`
+	// DataDir is the base directory; each node uses DataDir/<node id>.
+	// Defaults to <temp>/kaft-kafka.
+	DataDir string `yaml:"data_dir"`
+	// ClusterID is the fixed cluster ID all nodes are formatted with.
+	ClusterID string `yaml:"cluster_id"`
+	// Members is how many nodes the cluster should have. Defaults to
+	// expected_bootstrap.
+	Members int `yaml:"members"`
+	// Heap is the maximum heap of each Kafka process. Defaults to 512M.
+	Heap string `yaml:"heap"`
 }
 
 // MongoConfig configures the mongo controller and its workers. The controller
@@ -39,6 +62,7 @@ type ClusterConfig struct {
 	ExpectedBootstrap int          `yaml:"expected_bootstrap"`
 	Nodes             []NodeConfig `yaml:"nodes"`
 	Mongo             MongoConfig  `yaml:"mongo"`
+	Kafka             KafkaConfig  `yaml:"kafka"`
 }
 
 func ParseConfig(filePath string) (*ClusterConfig, error) {
