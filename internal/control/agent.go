@@ -105,7 +105,9 @@ func (a *Agent) loop(ctx context.Context, w Worker) {
 			return
 		case <-ticker.C:
 		}
-		if !a.caughtUp() {
+		// A worker does nothing, not even probe, until its controller has
+		// been started: probing can be invasive (it may wipe local data).
+		if !a.caughtUp() || !a.rt.Started(w.Name()) {
 			continue
 		}
 		a.report(ctx, w)

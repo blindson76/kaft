@@ -82,6 +82,9 @@ type Data struct {
 	// Await holds the orders ("kind@node") the current step waits for.
 	Await  map[string]bool `json:"await,omitempty"`
 	Failed bool            `json:"failed,omitempty"`
+	// DepsReady is true while the controllers this one depends on are in the
+	// states it requires. It gates forming the cluster, nothing else.
+	DepsReady bool `json:"deps_ready"`
 }
 
 func (d Data) Clone() Data {

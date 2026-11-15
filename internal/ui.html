@@ -143,6 +143,10 @@ function buildCard(diagram, index) {
   const sec = el('section');
   const head = el('div', 'ctl-head');
   head.append(el('h3', null, diagram.name), card.badge = el('span', 'state', '–'));
+  if (diagram.requires?.length) {
+    card.requires = diagram.requires.map(r => `${r.controller} in ${r.states.join(' or ')}`).join(', ');
+    head.append(card.deps = el('span', 'kv'));
+  }
   const body = el('div', 'ctl-body');
   card.diagram = el('div', 'diagram');
   const side = el('div', 'side');
@@ -239,7 +243,11 @@ function render(state) {
 
   for (const [name, card] of cards) {
     const ctl = (snap.controllers ?? {})[name] ?? {};
-    const active = (ctl.active ?? []).join(' / ') || '–';
+    // A controller whose dependencies never held yet has not been started:
+    // its machine exists but has received nothing, so no state is shown.
+    const started = (store.started ?? {})[name] === true;
+    const active = started ? ((ctl.active ?? []).join(' / ') || '–') : 'not started';
+    card.badge.style.background = started ? '' : 'var(--muted)';
     if (active !== card.active) {
       if (card.active !== null) {
         card.history.unshift({ at: new Date(), from: card.active, to: active });
@@ -248,8 +256,12 @@ function render(state) {
       }
       card.active = active;
       card.badge.textContent = active;
-      card.activeStates = ctl.active ?? [];
+      card.activeStates = started ? (ctl.active ?? []) : [];
       highlight(card);
+    }
+    if (card.deps) {
+      const ready = (store.deps ?? {})[name] === true;
+      card.deps.replaceChildren(el('span', 'dot ' + (ready ? 'ok' : 'bad')), document.createTextNode('requires ' + card.requires + (ready ? '' : ' (waiting)')));
     }
     card.data.replaceChildren(tree(ctl.data, '', card.open, 0));
     if (card.history.length === 0) {

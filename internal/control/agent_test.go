@@ -78,3 +78,41 @@ func TestAgentDoesNotExecuteDuringCatchUp(t *testing.T) {
 		t.Fatalf("new order executed %d times, want 1", n)
 	}
 }
+
+type probeCounter struct {
+	fakeWorker
+	name   string
+	probes atomic.Int64
+}
+
+func (w *probeCounter) Name() string { return w.name }
+func (w *probeCounter) Probe(context.Context) (any, error) {
+	w.probes.Add(1)
+	return map[string]any{}, nil
+}
+
+// The worker of a controller that has not been started must stay completely
+// idle: a probe can be invasive (Kafka's wipes the log directory).
+func TestAgentKeepsWorkerIdleUntilControllerStarted(t *testing.T) {
+	rt := NewRuntime()
+	a := fake("a")
+	rt.Register(a)
+	rt.Register(fake("b", Requirement{Controller: "a", States: []string{"up"}}))
+
+	wa, wb := &probeCounter{name: "a"}, &probeCounter{name: "b"}
+	submit := func(_ context.Context, ev Event) error { rt.Apply(ev); return nil }
+	agent := NewAgent("n1", rt, submit, wa, wb)
+	agent.interval = 5 * time.Millisecond
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	agent.Run(ctx)
+
+	waitFor(t, "worker a to probe", func() bool { return wa.probes.Load() > 0 })
+	time.Sleep(50 * time.Millisecond)
+	if n := wb.probes.Load(); n != 0 {
+		t.Fatalf("worker b probed %d time(s) before its controller started", n)
+	}
+
+	goTo(rt, "a", "up")
+	waitFor(t, "worker b to probe", func() bool { return wb.probes.Load() > 0 })
+}

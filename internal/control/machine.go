@@ -26,6 +26,7 @@ type machine[D gstate.Cloner[D]] struct {
 	initial D
 	host    Host
 	synced  chan struct{}
+	deps    []Requirement
 
 	mu     sync.RWMutex
 	actor  *gstate.Actor[string, string, D]
@@ -41,8 +42,18 @@ type machine[D gstate.Cloner[D]] struct {
 //     an event (On / Always), never from After or an invoke.
 //   - Any other raised event, including After timers, is committed to the
 //     raft log by the leader and comes back to this machine as a normal event.
-func NewMachine[D gstate.Cloner[D]](name string, def *gstate.Machine[string, string, D], initial D) Controller {
-	return &machine[D]{name: name, def: def, initial: initial, synced: make(chan struct{}, 1)}
+//
+// requires declares dependencies on other controllers. The machine is told
+// about them through EvDepsReady / EvDepsLost and decides what they gate.
+func NewMachine[D gstate.Cloner[D]](name string, def *gstate.Machine[string, string, D], initial D, requires ...Requirement) Controller {
+	return &machine[D]{name: name, def: def, initial: initial, synced: make(chan struct{}, 1), deps: requires}
+}
+
+func (m *machine[D]) Requires() []Requirement { return m.deps }
+
+func (m *machine[D]) HasState(state string) bool {
+	_, ok := m.def.States[state]
+	return ok
 }
 
 func (m *machine[D]) Name() string { return m.name }

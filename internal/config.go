@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"os"
 
+	"example.com/dstate/internal/control"
+
 	"gopkg.in/yaml.v3"
 )
 
@@ -37,6 +39,9 @@ type KafkaConfig struct {
 	Members int `yaml:"members"`
 	// Heap is the maximum heap of each Kafka process. Defaults to 512M.
 	Heap string `yaml:"heap"`
+	// DependsOn lists controllers that must be in given states before the
+	// cluster is formed.
+	DependsOn []control.Requirement `yaml:"depends_on"`
 }
 
 // MongoConfig configures the mongo controller and its workers. The controller
@@ -56,6 +61,9 @@ type MongoConfig struct {
 	Password string `yaml:"password"`
 	// Args are extra mongod command line arguments.
 	Args []string `yaml:"args"`
+	// DependsOn lists controllers that must be in given states before the
+	// replica set is formed.
+	DependsOn []control.Requirement `yaml:"depends_on"`
 }
 
 type ClusterConfig struct {

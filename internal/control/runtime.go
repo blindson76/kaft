@@ -5,7 +5,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"maps"
 	"slices"
+	"strings"
 	"sync"
 )
 
@@ -22,6 +24,12 @@ type store struct {
 	Reports map[string]map[string]json.RawMessage `json:"reports"`
 	// Orders holds the pending orders by ID.
 	Orders map[uint64]Order `json:"orders"`
+	// Deps records, per controller, whether its requirements held when last
+	// evaluated. A controller is told only when this flips.
+	Deps map[string]bool `json:"deps"`
+	// Started lists the controllers that have been started. A controller
+	// starts the first time its requirements hold, and stays started.
+	Started map[string]bool `json:"started"`
 }
 
 func newStore() store {
@@ -30,6 +38,8 @@ func newStore() store {
 		Boots:   map[string]string{},
 		Reports: map[string]map[string]json.RawMessage{},
 		Orders:  map[uint64]Order{},
+		Deps:    map[string]bool{},
+		Started: map[string]bool{},
 	}
 }
 
@@ -83,6 +93,24 @@ func (r *Runtime) Apply(ev Event) {
 	defer r.notify()
 	defer r.applyMu.Unlock()
 
+	// Before: start whatever can start, so that controllers without
+	// requirements see the very first event. After: react to the states the
+	// event led to.
+	r.settleDeps()
+	r.dispatch(ev)
+	r.settleDeps()
+}
+
+// deliver hands ev to c unless c has not been started yet. Controllers that
+// are not started see nothing; what they missed is replayed when they start.
+func (r *Runtime) deliver(c Controller, ev Event) {
+	if r.Started(c.Name()) {
+		c.Deliver(ev)
+	}
+}
+
+// dispatch updates the store for ev and delivers it.
+func (r *Runtime) dispatch(ev Event) {
 	node, _ := ev.Params["node"].(string)
 
 	switch ev.Name {
@@ -136,12 +164,12 @@ func (r *Runtime) Apply(ev Event) {
 
 	if ev.Target != "" {
 		if c := r.byName[ev.Target]; c != nil {
-			c.Deliver(ev)
+			r.deliver(c, ev)
 		}
 		return
 	}
 	for _, c := range r.controllers {
-		c.Deliver(ev)
+		r.deliver(c, ev)
 	}
 }
 
@@ -328,7 +356,7 @@ func (r *Runtime) notify() {
 func (r *Runtime) Diagrams() []Diagram {
 	out := make([]Diagram, 0, len(r.controllers))
 	for _, c := range r.controllers {
-		out = append(out, Diagram{Name: c.Name(), Mermaid: c.Diagram()})
+		out = append(out, Diagram{Name: c.Name(), Mermaid: c.Diagram(), Requires: c.Requires()})
 	}
 	return out
 }
@@ -337,4 +365,170 @@ func (r *Runtime) Diagrams() []Diagram {
 type Diagram struct {
 	Name    string `json:"name"`
 	Mermaid string `json:"mermaid"`
+	// Requires lists the controller's dependencies.
+	Requires []Requirement `json:"requires,omitempty"`
+}
+
+// unmet returns the requirements of c that do not hold right now.
+func (r *Runtime) unmet(c Controller) []string {
+	var out []string
+	for _, req := range c.Requires() {
+		target := r.byName[req.Controller]
+		ok := false
+		if target != nil {
+			for _, s := range target.States() {
+				if slices.Contains(req.States, s) {
+					ok = true
+					break
+				}
+			}
+		}
+		if !ok {
+			out = append(out, req.String())
+		}
+	}
+	return out
+}
+
+// Started reports whether the controller has been started. A name that is not
+// a registered controller counts as started.
+func (r *Runtime) Started(controller string) bool {
+	if r.byName[controller] == nil {
+		return true
+	}
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.store.Started[controller]
+}
+
+// start brings a controller to life once its requirements hold. Until now it
+// received no events and its worker did nothing. It is first told what it
+// missed that is still true, from the store: which nodes are alive and any
+// reports already filed for it. Then it gets EvDepsReady.
+func (r *Runtime) start(c Controller) {
+	name := c.Name()
+	if len(c.Requires()) > 0 {
+		log.Printf("[%s] dependencies ready, starting", name)
+	}
+
+	r.mu.Lock()
+	r.store.Started[name], r.store.Deps[name] = true, true
+	alive := maps.Clone(r.store.Alive)
+	reports := maps.Clone(r.store.Reports[name])
+	r.mu.Unlock()
+
+	for _, node := range slices.Sorted(maps.Keys(alive)) {
+		ev := EvNodeDown
+		if alive[node] {
+			ev = EvNodeUp
+		}
+		c.Deliver(Event{Name: ev, Params: map[string]any{"node": node}})
+	}
+	for _, node := range slices.Sorted(maps.Keys(reports)) {
+		var report any
+		if json.Unmarshal(reports[node], &report) == nil {
+			c.Deliver(Event{Target: name, Name: EvReport, Params: map[string]any{"node": node, "report": report}})
+		}
+	}
+	c.Deliver(Event{Target: name, Name: EvDepsReady})
+}
+
+// settleDeps re-evaluates every controller's requirements against the states
+// the controllers are in now. A controller that has not started yet is started
+// the first time its requirements hold. A started one is told with
+// EvDepsLost / EvDepsReady when they stop or resume holding; it is not stopped.
+// Starting or telling one controller can move it to a state another one waits
+// for, so this repeats until nothing changes.
+//
+// This runs on every replica around every committed event and depends only on
+// controller states, which are themselves a function of the log. So starting
+// controllers and the dependency events need no log entries of their own and
+// still happen on every replica at the same point.
+func (r *Runtime) settleDeps() {
+	for round := 0; round <= 2*len(r.controllers); round++ {
+		changed := false
+		for _, c := range r.controllers {
+			name := c.Name()
+			waiting := r.unmet(c)
+			ready := len(waiting) == 0
+
+			r.mu.Lock()
+			started := r.store.Started[name]
+			before, known := r.store.Deps[name]
+			if !started || before != ready {
+				r.store.Deps[name] = ready
+			}
+			r.mu.Unlock()
+
+			switch {
+			case !started && ready:
+				r.start(c)
+				changed = true
+			case !started:
+				if !known {
+					log.Printf("[%s] not started, waiting for: %s", name, strings.Join(waiting, ", "))
+				}
+			case before == ready:
+			case ready:
+				log.Printf("[%s] dependencies ready again", name)
+				c.Deliver(Event{Target: name, Name: EvDepsReady})
+				changed = true
+			default:
+				log.Printf("[%s] dependencies lost: %s", name, strings.Join(waiting, ", "))
+				c.Deliver(Event{Target: name, Name: EvDepsLost, Params: map[string]any{"waiting": waiting}})
+				changed = true
+			}
+		}
+		if !changed {
+			return
+		}
+	}
+	log.Printf("control: controller dependencies did not settle; check for requirements that undo each other")
+}
+
+// Validate checks the registered controllers' requirements: each must name a
+// registered controller and states that controller has, and requirements must
+// not form a cycle, which would leave every controller in it waiting forever.
+// Call it once after all controllers are registered.
+func (r *Runtime) Validate() error {
+	for _, c := range r.controllers {
+		for _, req := range c.Requires() {
+			target := r.byName[req.Controller]
+			if target == nil {
+				return fmt.Errorf("controller %q requires unknown controller %q", c.Name(), req.Controller)
+			}
+			if len(req.States) == 0 {
+				return fmt.Errorf("controller %q requires %q in no state", c.Name(), req.Controller)
+			}
+			for _, s := range req.States {
+				if !target.HasState(s) {
+					return fmt.Errorf("controller %q requires %q in state %q, which it does not have", c.Name(), req.Controller, s)
+				}
+			}
+		}
+	}
+	// Depth-first search for a cycle; path is the chain being explored.
+	done := map[string]bool{}
+	var visit func(name string, path []string) error
+	visit = func(name string, path []string) error {
+		if i := slices.Index(path, name); i >= 0 {
+			return fmt.Errorf("controller dependency cycle: %s", strings.Join(append(path[i:], name), " -> "))
+		}
+		if done[name] {
+			return nil
+		}
+		for _, req := range r.byName[name].Requires() {
+			if err := visit(req.Controller, append(path, name)); err != nil {
+				return err
+			}
+		}
+		done[name] = true
+		return nil
+	}
+	for _, c := range r.controllers {
+		if err := visit(c.Name(), nil); err != nil {
+			return err
+		}
+	}
+	return nil
 }

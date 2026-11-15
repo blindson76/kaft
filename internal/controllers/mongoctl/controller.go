@@ -64,7 +64,12 @@ func stepFailed(d Data) bool { return len(d.Await) == 0 && d.Failed }
 //	  - monitoring: steady state; replaces dead members, restarts returning ones.
 //	  - resetting: something failed or the set lost its majority. Stop every
 //	    mongod, which probes the data again, and decide from scratch.
-func NewController(t Topology) control.Controller {
+//
+// requires lists dependencies on other controllers. The runtime does not start
+// this controller, nor its workers, until they hold. If one is lost after
+// that, an established cluster keeps running and is still repaired; only
+// forming a new one waits for the dependency to come back.
+func NewController(t Topology, requires ...control.Requirement) control.Controller {
 	hosts := func(nodes []string) []string {
 		out := make([]string, 0, len(nodes))
 		for _, n := range nodes {
@@ -94,6 +99,14 @@ func NewController(t Topology) control.Controller {
 		})
 		sb.On(control.EvNodeDown).AssignEvent(func(d Data, e evt) Data {
 			d.Alive[control.Node(e)] = false
+			return d
+		})
+		sb.On(control.EvDepsReady).Assign(func(d Data) Data {
+			d.DepsReady = true
+			return d
+		})
+		sb.On(control.EvDepsLost).Assign(func(d Data) Data {
+			d.DepsReady = false
 			return d
 		})
 		sb.On(control.EvReport).AssignEvent(func(d Data, e evt) Data {
@@ -181,7 +194,12 @@ func NewController(t Topology) control.Controller {
 		fail(func() *transition { return sb.On(name) }, func(Data) bool { return true }, name)
 	}
 
-	form := func(d Data) (Plan, bool) { return formPlan(d, t) }
+	form := func(d Data) (Plan, bool) {
+		if !d.DepsReady {
+			return Plan{}, false
+		}
+		return formPlan(d, t)
+	}
 
 	def := gstate.New[string, string, Data](Name).
 		Initial("collecting").
@@ -268,5 +286,5 @@ func NewController(t Topology) control.Controller {
 		}).
 		Build()
 
-	return control.NewMachine(Name, def, Data{Alive: map[string]bool{}, Reports: map[string]Report{}})
+	return control.NewMachine(Name, def, Data{Alive: map[string]bool{}, Reports: map[string]Report{}}, requires...)
 }

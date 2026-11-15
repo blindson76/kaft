@@ -322,6 +322,9 @@ func (c *Cluster) Start(ctx context.Context) {
 	}()
 	go c.reconcileMembership(ctx)
 	go c.forwardRaised(ctx)
+	if err := c.rt.Validate(); err != nil {
+		log.Fatalf("invalid controller setup: %v", err)
+	}
 	go c.serveHTTP(ctx)
 	control.NewAgent(nodeID, c.rt, c.Submit, c.workers...).Run(ctx)
 	c.bsManager.Start(ctx)

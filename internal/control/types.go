@@ -20,6 +20,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"strings"
 
 	"github.com/blindson76/gstate"
 )
@@ -44,7 +45,33 @@ const (
 	// "error" for failures.
 	EvOrderDone   = "order.done"
 	EvOrderFailed = "order.failed"
+	// EvDepsReady is the last thing a controller receives when it is
+	// started, which happens once its dependencies (see Requirement) hold;
+	// immediately for a controller without any. After that, EvDepsLost and
+	// EvDepsReady report a dependency being lost and regained. Params of
+	// EvDepsLost: "waiting" (the unmet requirements, as text).
+	EvDepsReady = "deps.ready"
+	EvDepsLost  = "deps.lost"
 )
+
+// Requirement is a dependency between controllers: the controller declaring
+// it wants Controller to be in one of States.
+//
+// A controller is not started until all its requirements hold: it receives no
+// events and its worker stays idle, so nothing of it runs on any node. When it
+// starts it is told the current node liveness and then gets EvDepsReady.
+//
+// Starting is one-way. If a requirement stops holding later the controller
+// keeps running and is told with EvDepsLost (and EvDepsReady when it holds
+// again); how to react is the controller's decision.
+type Requirement struct {
+	Controller string   `json:"controller" yaml:"controller"`
+	States     []string `json:"states" yaml:"states"`
+}
+
+func (r Requirement) String() string {
+	return r.Controller + " in " + strings.Join(r.States, "|")
+}
 
 // RaiseOrder is the event name a controller raises (as an external event, from
 // a transition) to place orders. Build its params with Orders.
@@ -114,6 +141,11 @@ type Controller interface {
 	// Diagram returns the state machine as a Mermaid flowchart, for the web
 	// view. It never changes.
 	Diagram() string
+	// Requires lists what this controller depends on. It never changes.
+	Requires() []Requirement
+	// HasState reports whether the controller has a state with this name;
+	// used to reject requirements that could never be met.
+	HasState(state string) bool
 }
 
 // Host is what the Runtime offers to a Controller.

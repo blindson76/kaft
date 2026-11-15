@@ -64,7 +64,7 @@ func registerMongo(cluster *internal.Cluster, nodeID string, cfg *internal.Clust
 		log.Fatalf("node %s has no mongo_addr in the config", nodeID)
 	}
 
-	cluster.Register(mongoctl.NewController(topology), mongoctl.NewWorker(mongoctl.WorkerConfig{
+	cluster.Register(mongoctl.NewController(topology, m.DependsOn...), mongoctl.NewWorker(mongoctl.WorkerConfig{
 		Node:     nodeID,
 		Addr:     addr,
 		Bin:      m.Bin,
@@ -110,7 +110,7 @@ func registerKafka(cluster *internal.Cluster, nodeID string, cfg *internal.Clust
 		log.Fatalf("node %s has no kafka_addr / kafka_controller_addr in the config", nodeID)
 	}
 
-	cluster.Register(kafkactl.NewController(topology), kafkactl.NewWorker(kafkactl.WorkerConfig{
+	cluster.Register(kafkactl.NewController(topology, k.DependsOn...), kafkactl.NewWorker(kafkactl.WorkerConfig{
 		Node:           nodeID,
 		ID:             self.KafkaID,
 		Addr:           self.KafkaAddr,

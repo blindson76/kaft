@@ -1,6 +1,6 @@
 expected_bootstrap: 3
 mongo:
-  bin: C:\Users\ubozkurt\Downloads\mongodb-windows-x86_64-8.0.9\mongodb-win32-x86_64-windows-8.0.9\bin\mongod.exe
+  bin: C:\Users\ubozkurt\Downloads\mongodb-windows-x86_64-8.0.9\mongodb-win32-x86_64-windows-8.0.9\bin\cmongod.exe
   # data_dir: defaults to <temp>/kaft-mongo, one sub-directory per node
   replset: rs0
   members: 3
@@ -14,6 +14,11 @@ kafka:
   cluster_id: MkU3OEVBNTcwNTJENDM2Qg
   members: 3
   heap: 512M
+  # Wait for other controllers before forming the cluster, e.g. start Kafka
+  # only once the Mongo replica set is established:
+  # depends_on:
+  #   - controller: mongo
+  #     states: [monitoring]
 nodes:
   - id: node-1
     raft_addr: 127.0.0.1:7001
