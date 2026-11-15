@@ -19,6 +19,20 @@ kafka:
   # depends_on:
   #   - controller: mongo
   #     states: [monitoring]
+time:
+  # Keeps the system time through Meinberg NTP. With dry_run nothing on the
+  # machine is touched (ntp.conf, the NTP service, the clock): what would be
+  # done is only logged. Remove it on the real servers; kaft then needs
+  # administrator rights.
+  dry_run: true
+  # Per-node state: epoch, last time mode, time delta.
+  state_file: C:\Users\ubozkurt\AppData\Local\Temp\kaft-time\{node}.json
+  # External time servers (host or host:port). None reachable: internal mode.
+  external: []
+  # ntp_conf: C:\Program Files (x86)\NTP\etc\ntp.conf
+  # service: NTP
+  # jump_threshold: 2s   # an external source moving this much...
+  # jump_window: 10s     # ...within this time is no longer followed
 nodes:
   - id: node-1
     raft_addr: 127.0.0.1:7001

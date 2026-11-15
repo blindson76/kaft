@@ -7,6 +7,7 @@ import (
 	"io"
 	"log"
 	"net"
+	"net/http"
 	"slices"
 	"time"
 
@@ -77,6 +78,7 @@ type Cluster struct {
 	r         *raft.Raft
 	rt        *control.Runtime
 	workers   []control.Worker
+	routes    map[string]http.HandlerFunc
 }
 
 func NewCluster(self string, cfg *ClusterConfig) *Cluster {
@@ -102,6 +104,15 @@ func NewCluster(self string, cfg *ClusterConfig) *Cluster {
 // Register adds a controller and its node-local worker. Every node must
 // register the same controllers, before Start. worker may be nil for a
 // controller that needs no local agent.
+// Handle adds a route to the node's HTTP endpoint, for a controller's operator
+// API. pattern is a net/http pattern such as "POST /time". Call before Start.
+func (c *Cluster) Handle(pattern string, handler http.HandlerFunc) {
+	if c.routes == nil {
+		c.routes = map[string]http.HandlerFunc{}
+	}
+	c.routes[pattern] = handler
+}
+
 func (c *Cluster) Register(controller control.Controller, worker control.Worker) {
 	c.rt.Register(controller)
 	if worker != nil {

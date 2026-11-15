@@ -44,6 +44,8 @@ func postEvent(ctx context.Context, addr string, ev control.Event) error {
 //	GET  /state  raft and control state of this node, for inspection
 //	GET  /       live view of the state machines (see web.go)
 //	GET  /ws     WebSocket feed behind that view
+//
+// plus whatever the controllers added with Handle.
 func (c *Cluster) serveHTTP(ctx context.Context) {
 	mux := http.NewServeMux()
 
@@ -90,6 +92,9 @@ func (c *Cluster) serveHTTP(ctx context.Context) {
 		_, _ = w.Write(uiHTML)
 	})
 	mux.HandleFunc("GET /ws", c.serveWS)
+	for pattern, handler := range c.routes {
+		mux.HandleFunc(pattern, handler)
+	}
 
 	srv := &http.Server{Addr: c.nodesMap[c.nodeID].HTTPAddr, Handler: mux}
 	go func() {

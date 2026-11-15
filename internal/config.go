@@ -3,6 +3,7 @@ package internal
 import (
 	"fmt"
 	"os"
+	"time"
 
 	"example.com/dstate/internal/control"
 
@@ -21,6 +22,35 @@ type NodeConfig struct {
 	KafkaID             int    `yaml:"kafka_id"`
 	KafkaAddr           string `yaml:"kafka_addr"`
 	KafkaControllerAddr string `yaml:"kafka_controller_addr"`
+	// NTPAddr is the address the node's ntpd is reached at by the other
+	// nodes. Defaults to the host of RaftAddr.
+	NTPAddr string `yaml:"ntp_addr"`
+}
+
+// TimeConfig configures the time controller and its workers. The controller
+// is enabled when StateFile is set.
+type TimeConfig struct {
+	// StateFile is where a node keeps its time state (epoch, last time mode,
+	// time delta) between starts. "{node}" is replaced by the node ID.
+	StateFile string `yaml:"state_file"`
+	// External lists the external time servers, as host or host:port.
+	External []string `yaml:"external"`
+	// NTPConf is the ntp.conf of the Meinberg NTP installation, Service its
+	// Windows service name. Defaults: the standard installation, "NTP".
+	NTPConf string `yaml:"ntp_conf"`
+	Service string `yaml:"service"`
+	// DryRun leaves ntpd and the clock alone and only logs what would be
+	// done to them.
+	DryRun bool `yaml:"dry_run"`
+	// CheckInterval is how often the external servers are asked (default
+	// 2s). A server whose time moves by JumpThreshold within JumpWindow is
+	// no longer followed (defaults 2s and 10s).
+	CheckInterval time.Duration `yaml:"check_interval"`
+	JumpThreshold time.Duration `yaml:"jump_threshold"`
+	JumpWindow    time.Duration `yaml:"jump_window"`
+	// DependsOn lists controllers that must be in given states before the
+	// time controller starts.
+	DependsOn []control.Requirement `yaml:"depends_on"`
 }
 
 // KafkaConfig configures the kafka controller and its workers. The controller
@@ -71,6 +101,7 @@ type ClusterConfig struct {
 	Nodes             []NodeConfig `yaml:"nodes"`
 	Mongo             MongoConfig  `yaml:"mongo"`
 	Kafka             KafkaConfig  `yaml:"kafka"`
+	Time              TimeConfig   `yaml:"time"`
 }
 
 func ParseConfig(filePath string) (*ClusterConfig, error) {

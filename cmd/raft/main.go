@@ -4,12 +4,15 @@ import (
 	"context"
 	"flag"
 	"log"
+	"net"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"example.com/dstate/internal"
 	"example.com/dstate/internal/controllers/kafkactl"
 	"example.com/dstate/internal/controllers/mongoctl"
+	"example.com/dstate/internal/controllers/timectl"
 )
 
 func main() {
@@ -33,6 +36,9 @@ func main() {
 	}
 	if cfg.Kafka.Home != "" {
 		registerKafka(cluster, nodeID, cfg)
+	}
+	if cfg.Time.StateFile != "" {
+		registerTime(cluster, nodeID, cfg)
 	}
 	cluster.Start(context.Background())
 	select {}
@@ -122,4 +128,40 @@ func registerKafka(cluster *internal.Cluster, nodeID string, cfg *internal.Clust
 		Replication:    min(k.Members, 3),
 		Heap:           k.Heap,
 	}))
+}
+
+func registerTime(cluster *internal.Cluster, nodeID string, cfg *internal.ClusterConfig) {
+	t := cfg.Time
+	if t.NTPConf == "" {
+		t.NTPConf = `C:\Program Files (x86)\NTP\etc\ntp.conf`
+	}
+	if t.Service == "" {
+		t.Service = "NTP"
+	}
+
+	topology := timectl.Topology{Addrs: map[string]string{}, External: t.External}
+	for _, n := range cfg.Nodes {
+		addr := n.NTPAddr
+		if addr == "" {
+			addr, _, _ = net.SplitHostPort(n.RaftAddr)
+		}
+		topology.Addrs[n.ID] = addr
+	}
+
+	var system timectl.System = timectl.Meinberg{Conf: t.NTPConf, Service: t.Service}
+	if t.DryRun {
+		system = &timectl.DryRun{}
+	}
+	cluster.Register(timectl.NewController(topology, t.DependsOn...), timectl.NewWorker(timectl.WorkerConfig{
+		Node:          nodeID,
+		StateFile:     strings.ReplaceAll(t.StateFile, "{node}", nodeID),
+		External:      t.External,
+		Interval:      t.CheckInterval,
+		JumpThreshold: t.JumpThreshold,
+		JumpWindow:    t.JumpWindow,
+		System:        system,
+	}))
+	for pattern, handler := range timectl.Routes(cluster.Submit) {
+		cluster.Handle(pattern, handler)
+	}
 }
