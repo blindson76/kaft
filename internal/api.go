@@ -16,6 +16,11 @@ import (
 
 var httpClient = &http.Client{Timeout: 3 * time.Second}
 
+// forwardedHeader marks an event one node hands to the leader. A node that is
+// not the leader refuses such an event instead of passing it on again, so a
+// stale leader hint cannot bounce it around the cluster.
+const forwardedHeader = "X-Kaft-Forwarded"
+
 // postEvent hands ev to the node at addr, which must be the leader.
 func postEvent(ctx context.Context, addr string, ev control.Event) error {
 	body, err := json.Marshal(ev)
@@ -26,6 +31,7 @@ func postEvent(ctx context.Context, addr string, ev control.Event) error {
 	if err != nil {
 		return err
 	}
+	req.Header.Set(forwardedHeader, "1")
 	resp, err := httpClient.Do(req)
 	if err != nil {
 		return err
@@ -40,7 +46,7 @@ func postEvent(ctx context.Context, addr string, ev control.Event) error {
 
 // serveHTTP exposes the node's HTTP endpoint:
 //
-//	POST /event  commit an event (leader only; followers answer 503)
+//	POST /event  commit an event; any node takes it (see below)
 //	GET  /state  raft and control state of this node, for inspection
 //	GET  /       live view of the state machines (see web.go)
 //	GET  /ws     WebSocket feed behind that view
@@ -49,22 +55,48 @@ func postEvent(ctx context.Context, addr string, ev control.Event) error {
 func (c *Cluster) serveHTTP(ctx context.Context) {
 	mux := http.NewServeMux()
 
+	// An event from outside the cluster (an operator, another system) can
+	// be sent to any node: one that is not the leader passes it on. Such an
+	// event is stamped with "now_ms", this node's clock in Unix milliseconds,
+	// unless it carries one: a controller that needs the time of the request
+	// (a manual time setting) must not read a clock itself, as every replica
+	// would read a different one. An event passed on by another node is
+	// committed as it is, by the leader only.
 	mux.HandleFunc("POST /event", func(w http.ResponseWriter, r *http.Request) {
+		now := time.Now()
 		var ev control.Event
 		if err := json.NewDecoder(r.Body).Decode(&ev); err != nil {
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
-		// Not forwarded again: a stale leader hint must not bounce an event
-		// around the cluster. The sender retries.
-		if c.r.State() != raft.Leader {
-			http.Error(w, ErrNoLeader.Error(), http.StatusServiceUnavailable)
+		if r.Header.Get(forwardedHeader) != "" {
+			// The sender retries.
+			if c.r.State() != raft.Leader {
+				http.Error(w, ErrNoLeader.Error(), http.StatusServiceUnavailable)
+				return
+			}
+			if err := c.apply(ev); err != nil {
+				http.Error(w, err.Error(), http.StatusServiceUnavailable)
+			}
 			return
 		}
-		if err := c.apply(ev); err != nil {
+
+		if ev.Name == "" || ev.Internal {
+			http.Error(w, `expected {"target": "<controller>", "name": "<event>", "params": {...}}`, http.StatusBadRequest)
+			return
+		}
+		if ev.Params == nil {
+			ev.Params = map[string]any{}
+		}
+		if _, ok := ev.Params["now_ms"]; !ok {
+			ev.Params["now_ms"] = now.UnixMilli()
+		}
+		if err := c.Submit(r.Context(), ev); err != nil {
 			http.Error(w, err.Error(), http.StatusServiceUnavailable)
 			return
 		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(ev)
 	})
 
 	mux.HandleFunc("GET /state", func(w http.ResponseWriter, r *http.Request) {

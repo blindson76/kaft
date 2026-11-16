@@ -83,7 +83,7 @@ func (h *harness) apply(nodes ...string) map[string]Config {
 		out[node] = c
 		r := h.reports[node]
 		r.State = State{Epoch: c.Epoch, Mode: c.Persist, DeltaMS: c.DeltaMS, Master: c.Master}
-		r.Jump = ""
+		r.NTPD.Running = true
 		h.report(node, r)
 		h.rt.Apply(control.Event{Name: control.EvOrderDone, Params: map[string]any{"id": id, "node": node}})
 	}
@@ -100,7 +100,8 @@ func TestAutoWhenAnyNodeReachesAnExternalSource(t *testing.T) {
 
 	got := h.apply("n1", "n2", "n3")
 	h.state(ModeAuto)
-	want := Config{Epoch: 1, Mode: ModeAuto, Persist: ModeAuto, Servers: []string{"ext1", "ext2"}, Peers: []string{"h2", "h3"}}
+	// Only the source some node reaches is configured.
+	want := Config{Epoch: 1, Mode: ModeAuto, Persist: ModeAuto, Servers: []string{"ext2"}, Peers: []string{"h2", "h3"}}
 	if c := got["n1"]; !slices.Equal(c.Servers, want.Servers) || !slices.Equal(c.Peers, want.Peers) ||
 		c.Epoch != want.Epoch || c.Mode != want.Mode || c.Persist != want.Persist || c.Local {
 		t.Fatalf("n1 told %+v, want %+v", c, want)
@@ -136,7 +137,7 @@ func TestJumpingSourceLeadsToOrphan(t *testing.T) {
 	h.state(ModeAuto)
 
 	r := h.reports["n1"]
-	r.Jump = "ext1 moved 3s within 10s"
+	r.External, r.Faults = nil, map[string]string{"ext1": "jumped: moved 3s within 10s"}
 	h.report("n1", r)
 	h.state("configuring")
 	if c := h.apply("n1", "n2")["n2"]; c.Mode != ModeOrphan || c.Persist != ModeInternal || len(c.Servers) != 0 {
@@ -145,12 +146,12 @@ func TestJumpingSourceLeadsToOrphan(t *testing.T) {
 	h.state(ModeOrphan)
 }
 
-func TestInternalLastStateWinsAndCorrectionIsApplied(t *testing.T) {
-	// n3 was down when the mode changed and when the operator set the time.
-	// The external source is back, but the system stays internal.
+func TestInternalLastStateWins(t *testing.T) {
+	// n3 was down when the mode changed. The external source is back, but
+	// the system stays internal.
 	h := newHarness(t, map[string]Report{
-		"n1": {State: State{Epoch: 4, Mode: ModeInternal, DeltaMS: 5000}, External: []string{"ext1"}},
-		"n2": stored(4, ModeInternal, 5000),
+		"n1": {State: State{Epoch: 4, Mode: ModeInternal}, External: []string{"ext1"}},
+		"n2": stored(4, ModeInternal, 0),
 		"n3": stored(3, ModeAuto, 0),
 	})
 	got := h.apply("n1", "n2", "n3")
@@ -159,16 +160,10 @@ func TestInternalLastStateWinsAndCorrectionIsApplied(t *testing.T) {
 	if c := got["n1"]; !c.Local || len(c.Servers) != 0 || c.Epoch != 5 || c.Master != "n1" {
 		t.Fatalf("n1 told %+v, want master at epoch 5", c)
 	}
-	if c := got["n2"]; c.Local || !slices.Equal(c.Servers, []string{"h1"}) {
-		t.Fatalf("n2 told %+v, want to follow h1", c)
-	}
-	for _, node := range []string{"n1", "n2"} {
-		if c := got[node]; c.ShiftMS != 5000 || c.ShiftFrom != 4 || c.DeltaMS != 0 {
-			t.Fatalf("%s told %+v, want the 5s correction applied and cleared", node, c)
+	for _, node := range []string{"n2", "n3"} {
+		if c := got[node]; c.Local || !slices.Equal(c.Servers, []string{"h1"}) || c.DeltaMS != 0 {
+			t.Fatalf("%s told %+v, want to follow h1", node, c)
 		}
-	}
-	if c := got["n3"]; c.ShiftMS != 0 {
-		t.Fatalf("n3 told to shift by %dms, but its clock was not part of the correction", c.ShiftMS)
 	}
 }
 
@@ -202,11 +197,36 @@ func TestOperatorSetsTimeInInternalMode(t *testing.T) {
 	h.send(EvSetTime, map[string]any{"now_ms": float64(1_700_000_010_000), "time_ms": float64(1_700_000_000_000)})
 	h.state("configuring")
 	for node, c := range h.apply("n1", "n2") {
-		if c.DeltaMS != 10_000 || c.ShiftMS != 0 || c.Mode != ModeInternal {
-			t.Fatalf("%s told %+v, want a 10s delta stored and no shift now", node, c)
+		if c.DeltaMS != 10_000 || c.Mode != ModeInternal {
+			t.Fatalf("%s told %+v, want a 10s correction", node, c)
 		}
 	}
 	h.state(ModeInternal)
+
+	// The same through the generic event API, which gives the time as text.
+	h.send(EvSetTime, map[string]any{"now_ms": float64(1_700_000_000_500), "time": "2023-11-14T22:13:20Z"})
+	for node, c := range h.apply("n1", "n2") {
+		if c.DeltaMS != 500 {
+			t.Fatalf("%s told %+v, want a 500ms correction", node, c)
+		}
+	}
+
+	// A correction is handed out once: the next configuration has none.
+	h.down("n1")
+	if c := h.apply("n2")["n2"]; c.DeltaMS != 0 || !c.Local {
+		t.Fatalf("n2 told %+v, want master without a correction", c)
+	}
+}
+
+func TestSetTimeWithoutATimeIsIgnored(t *testing.T) {
+	h := newHarness(t, map[string]Report{"n1": stored(1, ModeInternal, 0)})
+	h.apply("n1")
+	h.send(EvSetTime, map[string]any{"now_ms": 2000.0, "time": "yesterday"})
+	h.send(EvSetTime, map[string]any{"time_ms": 1000.0})
+	h.state(ModeInternal)
+	if _, _, ok := h.pending("n1"); ok {
+		t.Fatal("an order was placed for an invalid manual time")
+	}
 }
 
 func TestSetTimeIsIgnoredOutsideInternalMode(t *testing.T) {
@@ -270,4 +290,99 @@ func TestNodeAheadOfTheControllerIsAdopted(t *testing.T) {
 		}
 	}
 	h.state(ModeAuto)
+}
+
+func TestFailedSourcesAreRemovedAndPutBack(t *testing.T) {
+	both := []string{"ext1", "ext2"}
+	h := newHarness(t, map[string]Report{"n1": {External: both}, "n2": {External: both}})
+	if c := h.apply("n1", "n2")["n1"]; !slices.Equal(c.Servers, both) {
+		t.Fatalf("n1 told %+v, want both sources", c)
+	}
+	h.state(ModeAuto)
+
+	// ext2 jumps, as n2 sees it: no node is to follow it.
+	r2 := h.reports["n2"]
+	r2.External, r2.Faults = []string{"ext1"}, map[string]string{"ext2": "jumped"}
+	h.report("n2", r2)
+	h.state("configuring")
+	for node, c := range h.apply("n1", "n2") {
+		if !slices.Equal(c.Servers, []string{"ext1"}) || c.Mode != ModeAuto || c.Epoch != 2 {
+			t.Fatalf("%s told %+v, want ext1 only at epoch 2", node, c)
+		}
+	}
+	h.state(ModeAuto)
+
+	// n1 loses ext1, but n2 still reaches it: nothing changes.
+	r1 := h.reports["n1"]
+	r1.External = []string{"ext2"}
+	h.report("n1", r1)
+	h.state(ModeAuto)
+	if _, _, ok := h.pending("n1"); ok {
+		t.Fatal("reconfigured although the source still works for a node")
+	}
+
+	// The hold-down of ext2 is over: it is put back.
+	r2 = h.reports["n2"]
+	r2.External, r2.Faults = both, nil
+	h.report("n2", r2)
+	if c := h.apply("n1", "n2")["n2"]; !slices.Equal(c.Servers, both) || c.Epoch != 3 {
+		t.Fatalf("n2 told %+v, want both sources back at epoch 3", c)
+	}
+
+	// Every source fails: orphan.
+	for _, node := range []string{"n1", "n2"} {
+		r := h.reports[node]
+		r.External = nil
+		h.report(node, r)
+	}
+	if c := h.apply("n1", "n2")["n1"]; c.Mode != ModeOrphan || len(c.Servers) != 0 {
+		t.Fatalf("n1 told %+v, want orphan", c)
+	}
+	h.state(ModeOrphan)
+}
+
+func internalUnderN1(t *testing.T) *harness {
+	h := newHarness(t, map[string]Report{"n1": {}, "n2": {}, "n3": {}})
+	h.send("collect.timeout", nil)
+	h.apply("n1", "n2", "n3")
+	h.state(ModeInternal)
+	return h
+}
+
+func TestMasterWhoseNtpdStoppedIsReplaced(t *testing.T) {
+	h := internalUnderN1(t)
+
+	r := h.reports["n1"]
+	r.NTPD = NTPDStatus{Error: "ntpd exit status 1"}
+	h.report("n1", r)
+	h.state("configuring")
+	got := h.apply("n1", "n2", "n3")
+	if !got["n2"].Local || got["n1"].Local || !slices.Equal(got["n1"].Servers, []string{"h2"}) ||
+		!slices.Equal(got["n3"].Servers, []string{"h2"}) {
+		t.Fatalf("got %+v, want n2 as master and n1 following it", got)
+	}
+	h.state(ModeInternal)
+}
+
+func TestMasterLostByAllFollowersIsReplaced(t *testing.T) {
+	h := internalUnderN1(t)
+	lost := NTPDStatus{Running: true, Peers: []Peer{{Addr: "h1", State: PeerUnreachable}}}
+
+	// One follower losing it is not enough: that may be its own problem.
+	r := h.reports["n3"]
+	r.NTPD = NTPDStatus{Running: true, Peers: []Peer{{Addr: "h1", State: PeerSync}}}
+	h.report("n3", r)
+	r = h.reports["n2"]
+	r.NTPD = lost
+	h.report("n2", r)
+	h.state(ModeInternal)
+
+	r = h.reports["n3"]
+	r.NTPD = lost
+	h.report("n3", r)
+	h.state("configuring")
+	got := h.apply("n1", "n2", "n3")
+	if !got["n2"].Local || !slices.Equal(got["n1"].Servers, []string{"h2"}) {
+		t.Fatalf("got %+v, want n2 as master", got)
+	}
 }

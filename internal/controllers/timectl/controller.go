@@ -1,6 +1,7 @@
 package timectl
 
 import (
+	"fmt"
 	"log"
 	"time"
 
@@ -36,12 +37,14 @@ const (
 //	  - collecting: wait for the reports, then pick the mode (decide).
 //	  - configuring: a new configuration is being handed to the nodes. It leads
 //	    to the state named after the mode once all of them have applied it.
-//	  - auto: the nodes follow the external source. Losing it, or seeing it
-//	    jump, leads to orphan.
+//	  - auto: the nodes follow the external sources that work. A source that
+//	    fails is taken out of the configuration, one that works again is put
+//	    back (each a new epoch). No working source left leads to orphan.
 //	  - orphan: the nodes hold each other's time and will bootstrap in internal
 //	    mode. Only an operator goes back to auto.
-//	  - internal: the nodes follow the master. A lost master is replaced; an
-//	    operator can set the time, which takes effect at the next bootstrap.
+//	  - internal: the nodes follow the master. A failed master is taken out
+//	    and replaced; an operator can set the time, which every node applies
+//	    to its clock as soon as it has the new configuration.
 //
 // In the three steady states a node that restarts or joins late is simply
 // given the current configuration.
@@ -99,8 +102,8 @@ func NewController(t Topology, requires ...control.Requirement) control.Controll
 	change := func(tr *transition, next func(Data, evt) Data) {
 		tr.AssignEvent(func(d Data, e evt) Data {
 			d = next(d, e)
-			log.Printf("[time] epoch %d: mode=%s master=%q delta=%dms shift=%dms (%s)",
-				d.Epoch, d.Mode, d.Master, d.Delta, d.Shift, d.Reason)
+			log.Printf("[time] epoch %d: mode=%s master=%q sources=%v delta=%dms (%s)",
+				d.Epoch, d.Mode, d.Master, d.Sources, d.Delta, d.Reason)
 			return d
 		}).
 			Raise(control.RaiseCancel, control.Cancel("")).
@@ -130,12 +133,21 @@ func NewController(t Topology, requires ...control.Requirement) control.Controll
 			}).
 			RaiseWith(control.RaiseOrder, func(d Data) gstate.Params { return control.Orders(d.orders(t, d.Batch)...) })
 	}
-	// setTime records a manual correction. It is not applied to the clocks
-	// now: every node stores it, and it is applied at the next bootstrap.
+	// setTime hands a manual correction to the nodes. Each stores it and
+	// sets its clock back by it at its next probe.
 	setTime := func(sb *builder) {
-		change(sb.On(EvSetTime).Guard(func(d Data) bool { return d.Mode == ModeInternal }), func(d Data, e evt) Data {
+		valid := func(d Data, e evt) bool {
+			_, ok := manualDelta(e.Params)
+			return d.Mode == ModeInternal && ok
+		}
+		ignored := func(d Data, e evt) bool { return !valid(d, e) }
+		sb.On(EvSetTime).GuardEvent(ignored).AssignEvent(func(d Data, e evt) Data {
+			log.Printf("[time] manual time ignored (mode %s, params %v): only taken in internal mode, with now_ms and time_ms or time", d.Mode, e.Params)
+			return d
+		})
+		change(sb.On(EvSetTime).GuardEvent(valid), func(d Data, e evt) Data {
 			d = d.next()
-			d.Delta = num(e.Params["now_ms"]) - num(e.Params["time_ms"])
+			d.Delta, _ = manualDelta(e.Params)
 			d.Reason = "time set by operator"
 			return d
 		})
@@ -143,20 +155,20 @@ func NewController(t Topology, requires ...control.Requirement) control.Controll
 	useAuto := func(sb *builder) {
 		change(sb.On(EvUseAuto).Guard(func(d Data) bool { return d.Mode != ModeAuto && d.external() }), func(d Data, _ evt) Data {
 			d = d.next()
-			d.Mode, d.Master, d.Delta, d.Reason = ModeAuto, "", 0, "operator switched to auto"
+			d.Mode, d.Master, d.Sources, d.Reason = ModeAuto, "", d.usable(), "operator switched to auto"
 			return d
 		})
 	}
 	replaceMaster := func(sb *builder) {
-		lost := func(d Data) bool {
+		failed := func(d Data) bool {
 			_, ok := d.newMaster()
-			return d.Mode == ModeInternal && !d.Alive[d.Master] && ok
+			return ok && d.masterFailed(t) != ""
 		}
-		change(sb.Always().Guard(lost), func(d Data, _ evt) Data {
-			was := d.Master
+		change(sb.Always().Guard(failed), func(d Data, _ evt) Data {
+			reason := d.masterFailed(t)
 			d.Master, _ = d.newMaster()
 			d = d.next()
-			d.Reason = "master " + was + " lost"
+			d.Reason = reason
 			return d
 		})
 	}
@@ -224,13 +236,23 @@ func NewController(t Topology, requires ...control.Requirement) control.Controll
 		}).
 		State(ModeAuto, func(sb *builder) {
 			steady(sb, ModeAuto, func() {
-				change(sb.Always().Guard(func(d Data) bool { return d.jump() != "" || !d.external() }), func(d Data, _ evt) Data {
-					reason := "external time source lost"
-					if j := d.jump(); j != "" {
-						reason = "external time source jumped (" + j + ")"
+				change(sb.Always().Guard(func(d Data) bool { return !d.external() }), func(d Data, _ evt) Data {
+					reason := "no working external time source"
+					if f := d.faults(); f != "" {
+						reason += " (" + f + ")"
 					}
 					d = d.next()
-					d.Mode, d.Reason = ModeOrphan, reason
+					d.Mode, d.Sources, d.Reason = ModeOrphan, nil, reason
+					return d
+				})
+				change(sb.Always().Guard(Data.sourcesChanged), func(d Data, _ evt) Data {
+					was := d.Sources
+					d = d.next()
+					d.Sources = d.usable()
+					d.Reason = fmt.Sprintf("external sources %v -> %v", was, d.Sources)
+					if f := d.faults(); f != "" {
+						d.Reason += " (" + f + ")"
+					}
 					return d
 				})
 			})
@@ -248,4 +270,23 @@ func NewController(t Topology, requires ...control.Requirement) control.Controll
 		Build()
 
 	return control.NewMachine(Name, def, Data{Alive: map[string]bool{}, Reports: map[string]Report{}}, requires...)
+}
+
+// manualDelta reads the correction of an EvSetTime: how far the clock of the
+// node that took the request was ahead of the time the operator gave.
+func manualDelta(p map[string]any) (int64, bool) {
+	now, ok := p["now_ms"]
+	if !ok || num(now) == 0 {
+		return 0, false
+	}
+	if at, ok := p["time_ms"]; ok && num(at) != 0 {
+		return num(now) - num(at), true
+	}
+	if text, ok := p["time"].(string); ok {
+		at, err := time.Parse(time.RFC3339Nano, text)
+		if err == nil {
+			return num(now) - at.UnixMilli(), true
+		}
+	}
+	return 0, false
 }

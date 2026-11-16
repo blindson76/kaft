@@ -1,17 +1,24 @@
-// Package timectl keeps the system time of the nodes consistent through the
-// node-local ntpd (Meinberg NTP): the Worker inspects the node and rewrites
-// the ntpd configuration, the controller decides the time mode.
+// Package timectl keeps the system time of the nodes consistent through a
+// node-local ntpd that the Worker runs as a standalone process (not as a
+// service): the Worker writes the ntpd configuration, supervises the process
+// and reports what ntpd makes of its sources; the controller decides the time
+// mode and the sources each node follows.
 //
 // There are two time modes:
 //
-//   - auto: an external time source is reachable and every node follows it.
+//   - auto: external time sources are reachable and every node follows them.
+//     The controller keeps the list of sources to the ones that work: a source
+//     that fails (stops answering, jumps, or is lost or distrusted by ntpd) is
+//     removed from the nodes' configuration, and put back once it works again.
 //   - internal: there is none. One node, the master, serves its own clock and
-//     the others follow it. An operator can correct the time by hand.
+//     the others follow it. A master that fails (its node goes down, its ntpd
+//     does not run, or every node following it has lost it) is replaced. An
+//     operator can correct the time by hand: every node sets its clock by the
+//     correction as soon as it learns of it.
 //
-// A running auto system that loses its source, or whose source jumps, does not
-// change mode. It goes orphan: the nodes stop following the source and keep
-// each other in step, and they record "internal" so that the next bootstrap
-// comes up in internal mode.
+// A running auto system that has no working source left does not change mode.
+// It goes orphan: the nodes keep each other in step, and they record
+// "internal" so that the next bootstrap comes up in internal mode.
 //
 // Every decision is a new epoch. Each node stores the epoch it last applied in
 // its state file, so after a restart the nodes with the highest epoch are the
@@ -22,6 +29,7 @@ import (
 	"encoding/json"
 	"maps"
 	"slices"
+	"strings"
 
 	"example.com/dstate/internal/control"
 )
@@ -41,11 +49,13 @@ const (
 	ModeOrphan = "orphan"
 )
 
-// Operator events, committed through the HTTP API.
+// Operator events, committed through the HTTP API of any node: POST /event
+// with {"target": "time", "name": ..., "params": ...}, or the routes of Routes.
 const (
 	// EvSetTime sets the time by hand, in internal mode. Params: "now_ms"
-	// (the clock of the node that took the request) and "time_ms" (what the
-	// operator says it is), both Unix milliseconds.
+	// (the clock of the node that took the request; the HTTP API fills it
+	// in) and what the operator says the time is: "time_ms" (Unix
+	// milliseconds) or "time" (RFC 3339).
 	EvSetTime = "time.set"
 	// EvUseAuto leaves internal or orphan mode for auto. It is ignored while
 	// no node reaches an external source.
@@ -58,24 +68,34 @@ type State struct {
 	Epoch uint64 `json:"epoch"`
 	// Mode is the mode to come up in at the next bootstrap: auto or internal.
 	Mode string `json:"mode,omitempty"`
-	// DeltaMS is a manual time correction waiting for the next bootstrap, in
-	// milliseconds: the clock is to be set back by this much.
-	DeltaMS int64  `json:"time_delta_ms"`
-	Master  string `json:"master,omitempty"`
-	Updated string `json:"updated,omitempty"`
+	// DeltaMS is a manual time correction not applied yet, in milliseconds:
+	// the clock is to be set back by this much. The worker applies it at its
+	// next probe and clears it.
+	DeltaMS int64 `json:"time_delta_ms"`
+	// AppliedDeltaMS and Applied are the last correction applied, and when.
+	AppliedDeltaMS int64  `json:"applied_delta_ms,omitempty"`
+	Applied        string `json:"applied,omitempty"`
+	Master         string `json:"master,omitempty"`
+	Updated        string `json:"updated,omitempty"`
 }
 
 // Report is the worker's report to the controller.
 type Report struct {
 	State State `json:"state"`
-	// External lists the external time servers this node reaches.
+	// External lists the external time servers this node reaches and that
+	// are not held back.
 	External []string `json:"external,omitempty"`
-	// Jump is set once an external server's time has moved by more than the
-	// allowed amount within the watch window. It stays set until the node is
-	// configured again.
-	Jump string `json:"jump,omitempty"`
+	// Faults lists the external servers held back, and why: one whose time
+	// moved by more than the allowed amount within the watch window, or one
+	// ntpd lost or calls a falseticker. A server is held back for a while
+	// after the fault was last seen.
+	Faults map[string]string `json:"faults,omitempty"`
+	// NTPD is the state of the local ntpd.
+	NTPD NTPDStatus `json:"ntpd"`
 	// Error tells why the state file could not be read; State is then empty.
 	Error string `json:"error,omitempty"`
+	// ShiftError tells why the pending correction could not be applied.
+	ShiftError string `json:"shift_error,omitempty"`
 }
 
 // Config is the argument of OrderConfigure: what one node has to apply.
@@ -92,12 +112,9 @@ type Config struct {
 	// other when no server is left.
 	Servers []string `json:"servers,omitempty"`
 	Peers   []string `json:"peers,omitempty"`
-	// DeltaMS is stored for the next bootstrap.
+	// DeltaMS is a manual correction: the node stores it and sets its clock
+	// back by it at its next probe.
 	DeltaMS int64 `json:"delta_ms,omitempty"`
-	// ShiftMS sets the clock back now, but only on a node whose state file is
-	// still at epoch ShiftFrom, so a repeated order does not shift twice.
-	ShiftMS   int64  `json:"shift_ms,omitempty"`
-	ShiftFrom uint64 `json:"shift_from,omitempty"`
 }
 
 func (c Config) args() map[string]any {
@@ -124,12 +141,10 @@ type Data struct {
 	Epoch uint64 `json:"epoch"`
 	// Master is the node serving the time in internal mode.
 	Master string `json:"master,omitempty"`
-	// Delta is the manual correction the nodes hold for the next bootstrap.
-	Delta int64 `json:"delta_ms"`
-	// Shift is a stored correction being applied now, to the nodes that
-	// reported epoch ShiftFrom.
-	Shift     int64  `json:"shift_ms,omitempty"`
-	ShiftFrom uint64 `json:"shift_from,omitempty"`
+	// Sources are the external servers the nodes follow in auto mode.
+	Sources []string `json:"sources,omitempty"`
+	// Delta is the manual correction handed out in this epoch.
+	Delta int64 `json:"delta_ms,omitempty"`
 	// Reason tells why the mode was chosen.
 	Reason string `json:"reason,omitempty"`
 	// Await holds the nodes with a configure order outstanding, Failed the
@@ -146,6 +161,7 @@ func (d Data) Clone() Data {
 	d.Await = maps.Clone(d.Await)
 	d.Failed = maps.Clone(d.Failed)
 	d.Batch = slices.Clone(d.Batch)
+	d.Sources = slices.Clone(d.Sources)
 	return d
 }
 
@@ -171,24 +187,50 @@ func (d Data) allReported() bool {
 	return true
 }
 
-// external reports whether some node reaches an external source it trusts.
-func (d Data) external() bool {
+// usable returns the external servers to follow, sorted: those some alive
+// node reaches, less those any alive node holds back. A fault such as a jump
+// lies with the server, so one node seeing it is enough.
+func (d Data) usable() []string {
+	ok, bad := map[string]bool{}, map[string]bool{}
 	for _, node := range d.reported() {
-		if r := d.Reports[node]; len(r.External) > 0 && r.Jump == "" {
-			return true
+		r := d.Reports[node]
+		for _, s := range r.External {
+			ok[s] = true
+		}
+		for s := range r.Faults {
+			bad[s] = true
 		}
 	}
-	return false
+	var out []string
+	for s := range ok {
+		if !bad[s] {
+			out = append(out, s)
+		}
+	}
+	slices.Sort(out)
+	return out
 }
 
-// jump returns the first reported jump of an external source, if any.
-func (d Data) jump() string {
+// external reports whether there is an external server to follow.
+func (d Data) external() bool { return len(d.usable()) > 0 }
+
+// sourcesChanged reports whether, in auto mode, the servers to follow are no
+// longer the ones the nodes are configured with. An empty list is not a
+// change: that is the way to orphan.
+func (d Data) sourcesChanged() bool {
+	u := d.usable()
+	return len(u) > 0 && !slices.Equal(u, d.Sources)
+}
+
+// faults describes the servers held back, for the log.
+func (d Data) faults() string {
+	var out []string
 	for _, node := range d.reported() {
-		if j := d.Reports[node].Jump; j != "" {
-			return node + ": " + j
+		for _, s := range slices.Sorted(maps.Keys(d.Reports[node].Faults)) {
+			out = append(out, node+": "+s+" "+d.Reports[node].Faults[s])
 		}
 	}
-	return ""
+	return strings.Join(out, "; ")
 }
 
 // newest returns the highest epoch reported and the nodes that are at it.
@@ -210,7 +252,7 @@ func (d Data) newest() (uint64, []string) {
 func (d Data) next() Data {
 	d.Epoch++
 	d.Await, d.Failed, d.Batch = nil, nil, nil
-	d.Shift, d.ShiftFrom = 0, 0
+	d.Delta = 0
 	return d
 }
 
@@ -233,31 +275,80 @@ func decide(d Data, force bool) (Data, bool) {
 
 	d.Epoch = epoch
 	d = d.next()
-	d.Master, d.Delta = "", 0
+	d.Master, d.Sources = "", nil
 	switch {
 	case last.Mode == ModeInternal:
 		d.Reason = "last state is internal"
 	case d.external():
-		d.Mode, d.Reason = ModeAuto, "external time source available"
+		d.Mode, d.Sources, d.Reason = ModeAuto, d.usable(), "external time source available"
 		return d, true
 	case force:
 		d.Reason = "no external time source"
 	default:
 		return d, false
 	}
-	// The master is one of the nodes that know the latest state: their clocks
-	// are the ones the correction below was measured against.
+	// The master is one of the nodes that know the latest state.
 	d.Mode, d.Master = ModeInternal, top[0]
-	if last.Mode == ModeInternal && last.DeltaMS != 0 {
-		d.Shift, d.ShiftFrom = last.DeltaMS, epoch
-	}
 	return d, true
 }
 
-// newMaster picks a replacement for a master that is gone: the lowest node
-// already following the current configuration, else the lowest one alive.
+// masterFailed tells why the internal master can no longer serve the time,
+// or "" if it can:
+//
+//   - its node is down;
+//   - its ntpd does not run although it applied the current configuration,
+//     or it failed to apply it;
+//   - every node that follows it under the current configuration and whose
+//     ntpd lists it reports it unreachable.
+func (d Data) masterFailed(t Topology) string {
+	if d.Mode != ModeInternal || d.Master == "" {
+		return ""
+	}
+	if !d.Alive[d.Master] {
+		return "master " + d.Master + " is down"
+	}
+	if d.Failed[d.Master] {
+		return "master " + d.Master + " could not be configured"
+	}
+	if r, ok := d.Reports[d.Master]; ok && r.State.Epoch == d.Epoch && !r.NTPD.Running {
+		return "ntpd of master " + d.Master + " is not running"
+	}
+	followers, lost := 0, 0
+	for _, node := range d.reported() {
+		r := d.Reports[node]
+		if node == d.Master || r.State.Epoch != d.Epoch {
+			continue
+		}
+		if p, ok := r.NTPD.peer(t.Addrs[d.Master]); ok {
+			followers++
+			if p.State == PeerUnreachable {
+				lost++
+			}
+		}
+	}
+	if followers > 0 && lost == followers {
+		return "master " + d.Master + " unreachable from its followers"
+	}
+	return ""
+}
+
+// healthy reports whether a node can be made master: its ntpd runs, or it
+// has not been configured yet, and its last order did not fail.
+func (d Data) healthy(node string) bool {
+	r := d.Reports[node]
+	return !d.Failed[node] && (r.NTPD.Running || r.State.Epoch != d.Epoch)
+}
+
+// newMaster picks a replacement for a master that failed: the lowest healthy
+// node already following the current configuration, else the lowest healthy
+// one alive. The failed master is never picked.
 func (d Data) newMaster() (string, bool) {
-	nodes := d.reported()
+	var nodes []string
+	for _, node := range d.reported() {
+		if node != d.Master && d.healthy(node) {
+			nodes = append(nodes, node)
+		}
+	}
 	for _, node := range nodes {
 		if d.Reports[node].State.Epoch == d.Epoch {
 			return node, true
@@ -300,9 +391,6 @@ func (d Data) settled() bool {
 // config builds the configuration of one node for the current epoch.
 func (d Data) config(t Topology, node string) Config {
 	c := Config{Epoch: d.Epoch, Mode: d.Mode, Persist: ModeInternal, Master: d.Master, DeltaMS: d.Delta}
-	if d.Shift != 0 && d.Reports[node].State.Epoch == d.ShiftFrom {
-		c.ShiftMS, c.ShiftFrom = d.Shift, d.ShiftFrom
-	}
 
 	if d.Mode == ModeInternal {
 		if node == d.Master {
@@ -322,7 +410,7 @@ func (d Data) config(t Topology, node string) Config {
 	}
 	if d.Mode == ModeAuto {
 		c.Persist = ModeAuto
-		c.Servers = slices.Clone(t.External)
+		c.Servers = slices.Clone(d.Sources)
 	}
 	return c
 }

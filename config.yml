@@ -20,8 +20,10 @@ kafka:
   #   - controller: mongo
   #     states: [monitoring]
 time:
-  # Keeps the system time through Meinberg NTP. With dry_run nothing on the
-  # machine is touched (ntp.conf, the NTP service, the clock): what would be
+  # Keeps the system time through ntpd (Meinberg NTP), which kaft runs as a
+  # standalone process with a configuration it writes itself. The NTP Windows
+  # service must be stopped and disabled: it would hold UDP port 123. With
+  # dry_run nothing on the machine is touched (ntpd, the clock): what would be
   # done is only logged. Remove it on the real servers; kaft then needs
   # administrator rights.
   dry_run: true
@@ -29,10 +31,17 @@ time:
   state_file: C:\Users\ubozkurt\AppData\Local\Temp\kaft-time\{node}.json
   # External time servers (host or host:port). None reachable: internal mode.
   external: []
-  # ntp_conf: C:\Program Files (x86)\NTP\etc\ntp.conf
-  # service: NTP
+  # ntpd: C:\Program Files (x86)\NTP\bin\ntpd.exe
+  # ntpq: defaults to ntpq.exe next to ntpd
+  # ntp_conf: written by kaft; defaults to ntp-{node}\ntp.conf next to the state file
+  # ntpd_args: []
+  # source_hold_down: 10m  # a failed external source is left out this long
+  # source_recover: 30s    # a lost source must answer this long to be used again
   # jump_threshold: 2s   # an external source moving this much...
   # jump_window: 10s     # ...within this time is no longer followed
+  # Manual time (internal mode only), on any node:
+  #   POST /time  {"time": "2026-11-15T12:00:00Z"}
+  #   POST /event {"target": "time", "name": "time.set", "params": {"time": "2026-11-15T12:00:00Z"}}
 nodes:
   - id: node-1
     raft_addr: 127.0.0.1:7001

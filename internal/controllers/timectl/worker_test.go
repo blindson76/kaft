@@ -6,6 +6,7 @@ import (
 	"errors"
 	"net"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -15,16 +16,24 @@ import (
 
 // fakeSystem records what the worker asked of ntpd and the clock.
 type fakeSystem struct {
-	confs  []string
-	shifts []time.Duration
-	err    error
+	confs    []string
+	shifts   []time.Duration
+	err      error
+	shiftErr error
+	status   NTPDStatus
 }
 
-func (s *fakeSystem) Apply(conf string, shift time.Duration) error {
+func (s *fakeSystem) Apply(conf string) error {
 	s.confs = append(s.confs, conf)
-	s.shifts = append(s.shifts, shift)
 	return s.err
 }
+
+func (s *fakeSystem) Shift(d time.Duration) error {
+	s.shifts = append(s.shifts, d)
+	return s.shiftErr
+}
+
+func (s *fakeSystem) Status(context.Context) NTPDStatus { return s.status }
 
 func testWorker(t *testing.T) (*Worker, *fakeSystem) {
 	sys := &fakeSystem{}
@@ -41,48 +50,85 @@ func configure(c Config) control.Order {
 	return control.Order{OrderSpec: control.OrderSpec{Node: "n1", Kind: OrderConfigure, Args: c.args()}}
 }
 
-func TestExecuteStoresStateAndShiftsOnce(t *testing.T) {
+func TestPendingCorrectionIsAppliedOnProbe(t *testing.T) {
 	w, sys := testWorker(t)
 	ctx := context.Background()
 
-	// Bootstrap in internal mode, an operator sets the time: stored only.
 	if err := w.Execute(ctx, configure(Config{Epoch: 1, Mode: ModeInternal, Persist: ModeInternal, Local: true})); err != nil {
 		t.Fatal(err)
 	}
+	probe(t, w)
+	if len(sys.shifts) != 0 {
+		t.Fatalf("clock shifted without a correction: %v", sys.shifts)
+	}
+
+	// An operator sets the time: the node stores the correction...
 	if err := w.Execute(ctx, configure(Config{Epoch: 2, Mode: ModeInternal, Persist: ModeInternal, Local: true, DeltaMS: 5000})); err != nil {
 		t.Fatal(err)
 	}
-	state, err := w.load()
-	if err != nil || state.Epoch != 2 || state.Mode != ModeInternal || state.DeltaMS != 5000 {
-		t.Fatalf("stored %+v (%v), want epoch 2, internal, 5000ms", state, err)
+	if state, err := w.load(); err != nil || state.Epoch != 2 || state.DeltaMS != 5000 {
+		t.Fatalf("stored %+v (%v), want epoch 2 with 5000ms pending", state, err)
 	}
-	if sys.shifts[0] != 0 || sys.shifts[1] != 0 {
-		t.Fatalf("clock shifted when the time was set: %v", sys.shifts)
-	}
-
-	// Next bootstrap: the correction is applied, and only once even if the
-	// order is delivered again.
-	next := configure(Config{Epoch: 3, Mode: ModeInternal, Persist: ModeInternal, Local: true, ShiftMS: 5000, ShiftFrom: 2})
-	for range 2 {
-		if err := w.Execute(ctx, next); err != nil {
-			t.Fatal(err)
+	// ...and applies it at the next probe, once.
+	for range 3 {
+		r := probe(t, w)
+		if r.State.DeltaMS != 0 || r.State.AppliedDeltaMS != 5000 || r.ShiftError != "" {
+			t.Fatalf("reported %+v, want the correction applied and cleared", r)
 		}
 	}
-	if len(sys.shifts) != 3 || sys.shifts[2] != 5*time.Second {
-		t.Fatalf("shifts %v, want exactly one of 5s at the end", sys.shifts)
+	if len(sys.shifts) != 1 || sys.shifts[0] != 5*time.Second {
+		t.Fatalf("shifts %v, want exactly one of 5s", sys.shifts)
 	}
-	if state, _ := w.load(); state.Epoch != 3 || state.DeltaMS != 0 {
-		t.Fatalf("stored %+v, want epoch 3 with the delta cleared", state)
+	// A configuration redelivered, or a later one, does not bring it back.
+	if err := w.Execute(ctx, configure(Config{Epoch: 3, Mode: ModeInternal, Persist: ModeInternal})); err != nil {
+		t.Fatal(err)
+	}
+	probe(t, w)
+	if len(sys.shifts) != 1 {
+		t.Fatalf("shifts %v, want still one", sys.shifts)
 	}
 }
 
-func TestExecuteDoesNotShiftANodeThatMissedTheCorrection(t *testing.T) {
+func TestPendingCorrectionSurvivesANewConfiguration(t *testing.T) {
 	w, sys := testWorker(t)
-	if err := w.Execute(context.Background(), configure(Config{Epoch: 3, Mode: ModeInternal, Persist: ModeInternal, ShiftMS: 5000, ShiftFrom: 2})); err != nil {
+	ctx := context.Background()
+	sys.shiftErr = errors.New("access denied")
+
+	if err := w.Execute(ctx, configure(Config{Epoch: 1, Mode: ModeInternal, Persist: ModeInternal, DeltaMS: 2000})); err != nil {
 		t.Fatal(err)
 	}
-	if sys.shifts[0] != 0 {
-		t.Fatalf("a node at epoch 0 shifted by %s for a correction made at epoch 2", sys.shifts[0])
+	if r := probe(t, w); r.ShiftError == "" || r.State.DeltaMS != 2000 {
+		t.Fatalf("reported %+v, want the failure and the correction still pending", r)
+	}
+	// Not tried again at once...
+	probe(t, w)
+	if len(sys.shifts) != 1 {
+		t.Fatalf("shifts %v, want one attempt before the retry interval", sys.shifts)
+	}
+	// ...a new master changes nothing about it...
+	if err := w.Execute(ctx, configure(Config{Epoch: 2, Mode: ModeInternal, Persist: ModeInternal, Servers: []string{"h2"}})); err != nil {
+		t.Fatal(err)
+	}
+	if state, _ := w.load(); state.DeltaMS != 2000 {
+		t.Fatalf("stored %+v, want the correction kept", state)
+	}
+	// ...and after the retry interval it goes through.
+	sys.shiftErr = nil
+	w.shiftTried = time.Now().Add(-shiftRetry)
+	if r := probe(t, w); r.ShiftError != "" || r.State.DeltaMS != 0 {
+		t.Fatalf("reported %+v, want the correction applied", r)
+	}
+
+	// Going to auto drops a correction not applied yet.
+	sys.shiftErr = errors.New("access denied")
+	if err := w.Execute(ctx, configure(Config{Epoch: 3, Mode: ModeInternal, Persist: ModeInternal, DeltaMS: 1000})); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Execute(ctx, configure(Config{Epoch: 4, Mode: ModeAuto, Persist: ModeAuto})); err != nil {
+		t.Fatal(err)
+	}
+	if state, _ := w.load(); state.DeltaMS != 0 {
+		t.Fatalf("stored %+v, want no correction in auto mode", state)
 	}
 }
 
@@ -153,33 +199,99 @@ func TestAvailabilityToleratesALostPacket(t *testing.T) {
 	if r := probe(t, w); len(r.External) != 0 {
 		t.Fatal("still available after three missed answers")
 	}
+
+	// Back, but it has to answer for a while first.
+	w.cfg.Recover = 50 * time.Millisecond
+	w.record("ext", time.Now(), nil)
+	if r := probe(t, w); len(r.External) != 0 {
+		t.Fatal("a lost server counted as available at its first answer")
+	}
+	time.Sleep(60 * time.Millisecond)
+	w.record("ext", time.Now(), nil)
+	if r := probe(t, w); len(r.External) != 1 {
+		t.Fatal("not available after answering for the recovery time")
+	}
 }
 
 func TestJumpDetection(t *testing.T) {
 	w, _ := testWorker(t)
+	w.cfg.HoldDown = 100 * time.Millisecond
 
 	// A steady source, even one far from the local clock, is not a jump.
 	for range 3 {
 		w.record("ext", time.Now().Add(time.Hour), nil)
 	}
-	if r := probe(t, w); r.Jump != "" {
-		t.Fatalf("steady source reported as jumping: %s", r.Jump)
+	if r := probe(t, w); len(r.Faults) != 0 || len(r.External) != 1 {
+		t.Fatalf("steady source reported as faulty: %+v", r)
 	}
-	// It moves by 3 seconds.
+	// It moves by 3 seconds: held back.
 	w.record("ext", time.Now().Add(time.Hour+3*time.Second), nil)
-	if r := probe(t, w); r.Jump == "" {
-		t.Fatal("3s move within the window not reported")
+	if r := probe(t, w); r.Faults["ext"] == "" || len(r.External) != 0 {
+		t.Fatalf("3s move within the window not reported: %+v", r)
 	}
-	// The report stays until the node is configured again.
-	w.record("ext", time.Now().Add(time.Hour+3*time.Second), nil)
-	if r := probe(t, w); r.Jump == "" {
-		t.Fatal("jump forgotten before it was acted on")
-	}
+	// Configuring the node does not end the hold-down...
 	if err := w.Execute(context.Background(), configure(Config{Epoch: 1, Mode: ModeOrphan, Persist: ModeInternal})); err != nil {
 		t.Fatal(err)
 	}
-	if r := probe(t, w); r.Jump != "" || r.State.Mode != ModeInternal {
-		t.Fatalf("after configuring: %+v, want no jump and internal stored", r)
+	w.record("ext", time.Now().Add(time.Hour+3*time.Second), nil)
+	if r := probe(t, w); r.Faults["ext"] == "" {
+		t.Fatal("fault forgotten before the hold-down ended")
+	}
+	// ...time does.
+	time.Sleep(120 * time.Millisecond)
+	if r := probe(t, w); len(r.Faults) != 0 || len(r.External) != 1 {
+		t.Fatalf("after the hold-down: %+v, want ext usable again", r)
+	}
+}
+
+func TestNtpdVerdictsHoldSourcesBack(t *testing.T) {
+	sys := &fakeSystem{}
+	w := NewWorker(WorkerConfig{
+		Node:      "n1",
+		StateFile: filepath.Join(t.TempDir(), "time.json"),
+		External:  []string{"ext.example:123", "10.0.0.9"},
+		System:    sys,
+	})
+	w.lookup = func(host string) ([]string, error) {
+		if host == "ext.example" {
+			return []string{"10.0.0.8"}, nil
+		}
+		return nil, errors.New("no such host")
+	}
+	for _, s := range w.cfg.External {
+		w.record(s, time.Now(), nil)
+	}
+
+	// ntpd lost 10.0.0.9: this node stops offering it, without blaming it.
+	w.monitor(NTPDStatus{Running: true, Peers: []Peer{{Addr: "10.0.0.8", State: PeerSync}, {Addr: "10.0.0.9", State: PeerUnreachable}}})
+	r := probe(t, w)
+	if !slices.Equal(r.External, []string{"ext.example:123"}) || len(r.Faults) != 0 || !r.NTPD.Running {
+		t.Fatalf("reported %+v, want only ext.example and no fault", r)
+	}
+	// ntpd calls ext.example a falseticker: that is the server's fault.
+	w.monitor(NTPDStatus{Running: true, Peers: []Peer{{Addr: "10.0.0.8", State: PeerFalseticker}}})
+	r = probe(t, w)
+	if len(r.External) != 0 || r.Faults["ext.example:123"] == "" {
+		t.Fatalf("reported %+v, want ext.example held back as a fault", r)
+	}
+}
+
+func TestParsePeers(t *testing.T) {
+	out := `     remote           refid      st t when poll reach   delay   offset  jitter
+==============================================================================
+*192.168.1.1     .GPS.            1 u   33   64  377    0.512   -0.027   0.011
++192.168.1.2     .GPS.            1 u   12   64  377    0.330    0.110   0.002
+x10.0.0.5        .GPS.            1 u   12   64  377    0.330  912.110   0.002
+ 10.0.0.6        .INIT.          16 u    -   64    0    0.000    0.000   0.000
+ 10.0.0.7        .GPS.            1 u  200   64  370    0.330    0.110   0.002
+ 127.127.1.0     .LOCL.           8 l   12   64  377    0.000    0.000   0.000
+`
+	want := []Peer{
+		{"192.168.1.1", PeerSync}, {"192.168.1.2", PeerCandidate}, {"10.0.0.5", PeerFalseticker},
+		{"10.0.0.6", PeerReject}, {"10.0.0.7", PeerUnreachable}, {"127.127.1.0", PeerReject},
+	}
+	if got := parsePeers(out); !slices.Equal(got, want) {
+		t.Fatalf("got %+v\nwant %+v", got, want)
 	}
 }
 
@@ -190,8 +302,8 @@ func TestSlowDriftIsNotAJump(t *testing.T) {
 	time.Sleep(80 * time.Millisecond)
 	// 3s away from the first reading, but that one is outside the window.
 	w.record("ext", time.Now().Add(3*time.Second), nil)
-	if r := probe(t, w); r.Jump != "" {
-		t.Fatalf("move outside the window reported: %s", r.Jump)
+	if r := probe(t, w); len(r.Faults) != 0 {
+		t.Fatalf("move outside the window reported: %v", r.Faults)
 	}
 }
 

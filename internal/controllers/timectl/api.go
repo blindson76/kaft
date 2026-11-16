@@ -15,9 +15,16 @@ import (
 //	POST /time       {"time": "2026-11-15T12:00:00Z"}   set the time by hand
 //	POST /time/mode  {"mode": "auto"}                   go back to auto mode
 //
-// submit commits an event from this node. A request is answered once its
-// event is committed; whether the controller acts on it depends on its state
-// (the time can only be set in internal mode), which GET /state shows.
+// They are shorthands for the generic event API, which every node serves as
+// well:
+//
+//	POST /event  {"target": "time", "name": "time.set", "params": {"time": "2026-11-15T12:00:00Z"}}
+//	POST /event  {"target": "time", "name": "time.auto"}
+//
+// Any node takes the request and passes the event on to the leader. submit
+// commits an event from this node. A request is answered once its event is
+// committed; whether the controller acts on it depends on its state (the time
+// can only be set in internal mode), which GET /state shows.
 func Routes(submit func(context.Context, control.Event) error) map[string]http.HandlerFunc {
 	commit := func(w http.ResponseWriter, r *http.Request, name string, params map[string]any) {
 		if err := submit(r.Context(), control.Event{Target: Name, Name: name, Params: params}); err != nil {

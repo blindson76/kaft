@@ -35,10 +35,18 @@ type TimeConfig struct {
 	StateFile string `yaml:"state_file"`
 	// External lists the external time servers, as host or host:port.
 	External []string `yaml:"external"`
-	// NTPConf is the ntp.conf of the Meinberg NTP installation, Service its
-	// Windows service name. Defaults: the standard installation, "NTP".
+	// NTPD is the ntpd executable, run as a standalone process (not as a
+	// service, which must be stopped: it would hold port 123). NTPQ is the
+	// ntpq executable used to ask ntpd about its sources. Defaults: the
+	// Meinberg NTP installation, ntpq next to ntpd.
+	NTPD string `yaml:"ntpd"`
+	NTPQ string `yaml:"ntpq"`
+	// NTPDArgs are added to the ntpd command line.
+	NTPDArgs []string `yaml:"ntpd_args"`
+	// NTPConf is the ntpd configuration file written by kaft; the drift, pid
+	// and log files go next to it. "{node}" is replaced by the node ID.
+	// Default: ntp-{node}/ntp.conf next to the state file.
 	NTPConf string `yaml:"ntp_conf"`
-	Service string `yaml:"service"`
 	// DryRun leaves ntpd and the clock alone and only logs what would be
 	// done to them.
 	DryRun bool `yaml:"dry_run"`
@@ -48,6 +56,11 @@ type TimeConfig struct {
 	CheckInterval time.Duration `yaml:"check_interval"`
 	JumpThreshold time.Duration `yaml:"jump_threshold"`
 	JumpWindow    time.Duration `yaml:"jump_window"`
+	// SourceHoldDown is how long a failed external server is kept out of the
+	// configuration (default 10m). SourceRecover is how long a lost server
+	// must answer without a miss before it is used again (default 30s).
+	SourceHoldDown time.Duration `yaml:"source_hold_down"`
+	SourceRecover  time.Duration `yaml:"source_recover"`
 	// DependsOn lists controllers that must be in given states before the
 	// time controller starts.
 	DependsOn []control.Requirement `yaml:"depends_on"`

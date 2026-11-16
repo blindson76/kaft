@@ -132,12 +132,17 @@ func registerKafka(cluster *internal.Cluster, nodeID string, cfg *internal.Clust
 
 func registerTime(cluster *internal.Cluster, nodeID string, cfg *internal.ClusterConfig) {
 	t := cfg.Time
+	stateFile := strings.ReplaceAll(t.StateFile, "{node}", nodeID)
+	if t.NTPD == "" {
+		t.NTPD = `C:\Program Files (x86)\NTP\bin\ntpd.exe`
+	}
+	if t.NTPQ == "" {
+		t.NTPQ = filepath.Join(filepath.Dir(t.NTPD), "ntpq"+filepath.Ext(t.NTPD))
+	}
 	if t.NTPConf == "" {
-		t.NTPConf = `C:\Program Files (x86)\NTP\etc\ntp.conf`
+		t.NTPConf = filepath.Join(filepath.Dir(stateFile), "ntp-{node}", "ntp.conf")
 	}
-	if t.Service == "" {
-		t.Service = "NTP"
-	}
+	t.NTPConf = strings.ReplaceAll(t.NTPConf, "{node}", nodeID)
 
 	topology := timectl.Topology{Addrs: map[string]string{}, External: t.External}
 	for _, n := range cfg.Nodes {
@@ -148,17 +153,19 @@ func registerTime(cluster *internal.Cluster, nodeID string, cfg *internal.Cluste
 		topology.Addrs[n.ID] = addr
 	}
 
-	var system timectl.System = timectl.Meinberg{Conf: t.NTPConf, Service: t.Service}
+	var system timectl.System = &timectl.NTPD{Bin: t.NTPD, Ntpq: t.NTPQ, Conf: t.NTPConf, Args: t.NTPDArgs}
 	if t.DryRun {
 		system = &timectl.DryRun{}
 	}
 	cluster.Register(timectl.NewController(topology, t.DependsOn...), timectl.NewWorker(timectl.WorkerConfig{
 		Node:          nodeID,
-		StateFile:     strings.ReplaceAll(t.StateFile, "{node}", nodeID),
+		StateFile:     stateFile,
 		External:      t.External,
 		Interval:      t.CheckInterval,
 		JumpThreshold: t.JumpThreshold,
 		JumpWindow:    t.JumpWindow,
+		HoldDown:      t.SourceHoldDown,
+		Recover:       t.SourceRecover,
 		System:        system,
 	}))
 	for pattern, handler := range timectl.Routes(cluster.Submit) {
