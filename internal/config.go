@@ -294,11 +294,21 @@ func ParseConfig(filePath string) (*ClusterConfig, error) {
 	return ParseConfigBytes(data)
 }
 
+// ParseConfigBytes parses a config document. Values may refer to environment
+// variables; see expandEnv.
 func ParseConfigBytes(data []byte) (*ClusterConfig, error) {
-	var cfg ClusterConfig
-
-	if err := yaml.Unmarshal(data, &cfg); err != nil {
+	var doc yaml.Node
+	if err := yaml.Unmarshal(data, &doc); err != nil {
 		return nil, fmt.Errorf("yaml parse error: %w", err)
+	}
+	if err := expandEnv(&doc, os.LookupEnv); err != nil {
+		return nil, fmt.Errorf("config: %w", err)
+	}
+	var cfg ClusterConfig
+	if len(doc.Content) > 0 {
+		if err := doc.Decode(&cfg); err != nil {
+			return nil, fmt.Errorf("yaml parse error: %w", err)
+		}
 	}
 	cfg.normalize()
 	if err := cfg.Validate(); err != nil {
