@@ -121,6 +121,8 @@ func (c *Cluster) fetchAgentState(ctx context.Context, node string) (control.Age
 // A worker-only node only serves GET /state with its roles and workers; the
 // leader also checks its liveness against this endpoint.
 //
+// Every node serves GET /metrics: live metrics of its workers (metrics.go).
+//
 // Both serve whatever the controllers added with Handle.
 func (c *Cluster) serveHTTP(ctx context.Context) {
 	mux := http.NewServeMux()
@@ -139,6 +141,7 @@ func (c *Cluster) serveHTTP(ctx context.Context) {
 			})
 		})
 	}
+	mux.HandleFunc("GET /metrics", c.serveMetrics)
 	for pattern, handler := range c.routes {
 		mux.HandleFunc(pattern, handler)
 	}

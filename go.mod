@@ -6,6 +6,10 @@ require (
 	github.com/blindson76/gstate v0.0.0-20261114125255-578223d90f49
 	github.com/coder/websocket v1.8.15
 	github.com/hashicorp/raft v1.8.0
+	github.com/miekg/dns v1.1.67
+	github.com/twmb/franz-go v1.22.3
+	github.com/twmb/franz-go/pkg/kadm v1.20.0
+	github.com/twmb/franz-go/pkg/kmsg v1.15.1
 	go.mongodb.org/mongo-driver/v2 v2.10.0
 	gopkg.in/yaml.v3 v3.0.1
 )
@@ -22,7 +26,7 @@ require (
 	github.com/kr/text v0.2.0 // indirect
 	github.com/mattn/go-colorable v0.1.12 // indirect
 	github.com/mattn/go-isatty v0.0.14 // indirect
-	github.com/miekg/dns v1.1.67 // indirect
+	github.com/pierrec/lz4/v4 v4.1.33 // indirect
 	github.com/xdg-go/scram v1.4.0 // indirect
 	github.com/xdg-go/stringprep v1.0.4 // indirect
 	github.com/youmark/pkcs8 v0.0.0-20240726163527-a2c0da244d78 // indirect

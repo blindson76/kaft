@@ -90,6 +90,23 @@ func (c *Cluster) serveWS(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Metrics are polled from every node while this view is open, on their
+	// own goroutine so a slow node never delays the state.
+	go func() {
+		t := time.NewTicker(metricsInterval)
+		defer t.Stop()
+		for {
+			if _, err := send(c.clusterMetrics(ctx)); err != nil {
+				return
+			}
+			select {
+			case <-ctx.Done():
+				return
+			case <-t.C:
+			}
+		}
+	}()
+
 	changed, unsubscribe := c.rt.Subscribe()
 	defer unsubscribe()
 	// Raft role, leader and membership change without a control event, so

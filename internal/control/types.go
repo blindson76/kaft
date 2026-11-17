@@ -178,6 +178,13 @@ type Worker interface {
 	Execute(ctx context.Context, order Order) error
 }
 
+// MetricsWorker is a Worker that also offers live metrics of its service, for
+// the web view. They are read on demand and never go through the raft log.
+// Metrics should answer quickly and may return cached values.
+type MetricsWorker interface {
+	Metrics(ctx context.Context) (any, error)
+}
+
 // Node returns the "node" parameter of a framework event.
 func Node(e gstate.Event[string]) string {
 	s, _ := e.Params["node"].(string)

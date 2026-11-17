@@ -62,6 +62,19 @@
   .tree .k { color: var(--muted); }
   .hist div { display: flex; gap: 10px; } .hist time { color: var(--muted); }
   .note { color: var(--muted); font-size: 12px; margin-top: 6px; }
+  #alerts { border-radius: 8px; padding: 10px 16px; font-weight: 500; }
+  #alerts.ok { background: color-mix(in srgb, var(--ok) 14%, var(--panel)); border: 1px solid var(--ok); }
+  #alerts.bad { background: color-mix(in srgb, var(--bad) 14%, var(--panel)); border: 1px solid var(--bad); }
+  #alerts ul { margin: 4px 0 0; padding-left: 20px; } #alerts li { margin: 2px 0; }
+  .metrics-head { display: flex; flex-wrap: wrap; gap: 8px 22px; margin-bottom: 10px; }
+  .stat { display: flex; flex-direction: column; } .stat b { font-size: 18px; font-variant-numeric: tabular-nums; }
+  .stat span { color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: .05em; }
+  .stat.bad b, td.bad { color: var(--bad); font-weight: 600; } .stat.warn b, td.warn { color: var(--warn); font-weight: 600; }
+  td.num { font-variant-numeric: tabular-nums; white-space: nowrap; }
+  .metrics table { font-size: 13px; } .metrics td { white-space: nowrap; }
+  .metrics section { overflow-x: auto; }
+  svg.spark { vertical-align: middle; margin-left: 6px; }
+  svg.spark polyline { fill: none; stroke: var(--accent); stroke-width: 1.5; }
 </style>
 </head>
 <body>
@@ -73,6 +86,11 @@
   <span class="kv" style="margin-left:auto"><span class="dot" id="h-dot"></span><span id="h-conn">connecting…</span></span>
 </header>
 <main>
+  <div id="alerts" class="ok">Waiting for metrics…</div>
+  <div class="row metrics">
+    <section><h2>MongoDB</h2><div id="m-mongo" class="empty">No mongo workers.</div></section>
+    <section><h2>Kafka</h2><div id="m-kafka" class="empty">No kafka workers.</div></section>
+  </div>
   <div class="row">
     <section><h2>Nodes</h2><div class="chips" id="nodes"></div>
       <div class="note">Dot: liveness as replicated. Each node serves its own replica; open another to compare.</div></section>
@@ -276,6 +294,169 @@ function render(state) {
   }
 }
 
+// --- Live metrics ------------------------------------------------------------
+// Pushed every 2s. Each node reports what it sees; alerts that several nodes
+// see alike (a cluster-wide problem) are shown once.
+let lastState = null, lastMetrics = null;
+const series = new Map(); // "node/what" -> recent values, for the trend lines
+
+function push(key, v) {
+  const s = series.get(key) ?? [];
+  s.push(v ?? 0); if (s.length > 60) s.shift();
+  series.set(key, s);
+}
+function spark(key) {
+  const s = series.get(key) ?? [], w = 80, h = 18, top = Math.max(...s, 1);
+  const pts = s.map((v, i) => `${(i / 59 * w).toFixed(1)},${(h - 1 - v / top * (h - 2)).toFixed(1)}`).join(' ');
+  const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+  svg.setAttribute('class', 'spark'); svg.setAttribute('width', w); svg.setAttribute('height', h);
+  svg.innerHTML = `<polyline points="${pts}"/>`;
+  return svg;
+}
+const fmt = (v, d = 0) => v == null ? '–' : Number(v).toLocaleString(undefined, { maximumFractionDigits: d });
+function dur(sec) {
+  if (sec == null) return '–';
+  if (sec < 90) return fmt(sec, sec < 10 ? 1 : 0) + 's';
+  if (sec < 5400) return fmt(sec / 60) + 'm';
+  if (sec < 172800) return fmt(sec / 3600, 1) + 'h';
+  return fmt(sec / 86400, 1) + 'd';
+}
+function stat(label, value, level) {
+  const s = el('div', 'stat' + (level ? ' ' + level : ''));
+  s.append(el('b', null, value), el('span', null, label));
+  return s;
+}
+function cell(text, cls) { return el('td', cls, text); }
+// short keeps long driver errors from stretching the layout; the full text
+// is in the tooltip.
+function short(text, n = 70) { return text && text.length > n ? text.slice(0, n - 1) + '…' : text; }
+function errCell(text, cls) { const td = el('td', cls, short(text)); td.title = text; td.colSpan = 7; return td; }
+function members(name) {
+  return lastState?.control?.snapshot?.controllers?.[name]?.data?.members ?? [];
+}
+function workerMetrics(name) {
+  const out = [];
+  for (const [node, nm] of Object.entries(lastMetrics?.nodes ?? {})) {
+    if (nm.error) { out.push({ node, error: nm.error }); continue; }
+    const w = nm.workers?.[name];
+    if (w) out.push({ node, error: w.error, m: w.metrics });
+  }
+  return out.sort((a, b) => a.node.localeCompare(b.node));
+}
+
+function renderMetrics() {
+  if (!lastMetrics) return;
+  const alerts = new Set();
+  for (const [name, render] of [['mongo', renderMongo], ['kafka', renderKafka]]) {
+    const rows = workerMetrics(name);
+    const isMember = new Set(members(name));
+    for (const r of rows) {
+      for (const a of r.m?.alerts ?? []) alerts.add(a);
+      if (!isMember.has(r.node)) continue;
+      if (r.error) alerts.add(`${name} member ${r.node}: metrics unavailable (${short(r.error, 100)})`);
+      else if (r.m && !r.m.running) alerts.add(`${name} member ${r.node}: not running`);
+    }
+    render(rows, isMember);
+  }
+  const box = $('alerts');
+  if (alerts.size === 0) {
+    box.className = 'ok';
+    box.textContent = 'No critical alerts · metrics at ' + new Date(lastMetrics.at).toLocaleTimeString();
+  } else {
+    box.className = 'bad';
+    const ul = el('ul');
+    for (const a of [...alerts].sort()) ul.append(el('li', null, a));
+    box.replaceChildren(document.createTextNode(`${alerts.size} critical alert${alerts.size > 1 ? 's' : ''}`), ul);
+  }
+}
+
+// Each render is called once per metrics message, so the trend lines advance
+// with time; a state message repaints without pushing.
+let pushing = false;
+
+function renderMongo(rows, isMember) {
+  const box = $('m-mongo');
+  if (rows.length === 0) return;
+  box.className = '';
+  let ops = 0, primary = null, maxLag = 0;
+  for (const r of rows) {
+    const total = Object.values(r.m?.ops ?? {}).reduce((a, b) => a + b, 0);
+    if (pushing) push(r.node + '/mongo', total);
+    if (r.m?.running) ops += total;
+    if (r.m?.role === 'primary') primary = r.node;
+    maxLag = Math.max(maxLag, r.m?.lag_sec ?? 0);
+  }
+  if (pushing) push('mongo', ops);
+  const head = el('div', 'metrics-head');
+  const ss = el('div', 'stat'); ss.append(el('b', null, fmt(ops, 1)), el('span', null, 'ops/s'));
+  ss.firstChild.append(spark('mongo'));
+  head.append(stat('primary', primary ?? 'none', primary ? '' : 'bad'),
+    stat('members up', `${rows.filter(r => isMember.has(r.node) && r.m?.running).length} / ${isMember.size}`),
+    stat('max lag', dur(maxLag), maxLag >= 10 ? 'bad' : ''), ss);
+
+  const table = el('table');
+  table.innerHTML = '<tr><th>Node</th><th>Role</th><th>Lag</th><th>Ops/s (ins · qry · upd · del · cmd)</th><th>Conns</th><th>Mem</th><th>Oplog window</th><th>Uptime</th></tr>';
+  for (const r of rows) {
+    const tr = el('tr'), m = r.m;
+    const name = r.node + (isMember.has(r.node) ? '' : ' (spare)');
+    if (r.error || !m) { tr.append(cell(name), errCell(r.error ?? '–', isMember.has(r.node) ? 'bad' : '')); table.append(tr); continue; }
+    if (!m.running) { tr.append(cell(name), cell('not running', isMember.has(r.node) ? 'bad' : 'empty')); table.append(tr); continue; }
+    const o = m.ops ?? {};
+    const opsCell = cell([o.insert, o.query, o.update, o.delete, o.command].map(v => fmt(v, 1)).join(' · '), 'num');
+    opsCell.append(spark(r.node + '/mongo'));
+    const connPct = m.connections_max ? m.connections / m.connections_max * 100 : 0;
+    tr.append(cell(name), cell(m.role, m.role === 'primary' || m.role === 'secondary' ? '' : 'warn'),
+      cell(m.lag_sec == null ? '–' : dur(m.lag_sec), 'num' + (m.lag_sec >= 10 ? ' bad' : '')), opsCell,
+      cell(`${m.connections} / ${fmt(m.connections_max)}`, 'num' + (connPct >= 80 ? ' bad' : '')),
+      cell(fmt(m.resident_mb) + ' MB', 'num'),
+      cell(`${dur(m.oplog_window_sec)} (${fmt(m.oplog_used_pct)}% full)`, 'num'),
+      cell(dur(m.uptime_sec), 'num'));
+    table.append(tr);
+  }
+  box.replaceChildren(head, table);
+}
+
+function renderKafka(rows, isMember) {
+  const box = $('m-kafka');
+  if (rows.length === 0) return;
+  box.className = '';
+  // Cluster-wide numbers: from any running member (they agree).
+  const c = rows.find(r => r.m?.running && isMember.has(r.node))?.m ?? rows.find(r => r.m?.running)?.m;
+  if (pushing) push('kafka', c?.messages_per_sec);
+  const head = el('div', 'metrics-head');
+  if (c) {
+    const ms = el('div', 'stat'); ms.append(el('b', null, fmt(c.messages_per_sec, 1)), el('span', null, 'messages/s'));
+    ms.firstChild.append(spark('kafka'));
+    head.append(
+      stat('quorum leader', c.quorum_leader >= 0 ? 'broker ' + c.quorum_leader : 'none', c.quorum_leader >= 0 ? '' : 'bad'),
+      stat('brokers', String(c.brokers?.length ?? 0)),
+      stat('topics / partitions', `${c.topics} / ${c.partitions}`),
+      stat('under-replicated', String(c.under_replicated?.length ?? 0), c.under_replicated?.length ? 'bad' : ''),
+      stat('offline', String(c.offline?.length ?? 0), c.offline?.length ? 'bad' : ''),
+      ms,
+      stat('consumer lag', `${fmt(c.group_lag)} (${c.groups} groups)`));
+  } else {
+    head.append(stat('cluster', 'no broker running', 'bad'));
+  }
+  const voters = new Map((c?.voters ?? []).map(v => [v.id, v]));
+  const table = el('table');
+  table.innerHTML = '<tr><th>Node</th><th>Broker</th><th>Quorum</th><th>Voter lag</th><th>Caught up</th><th>Leads partitions</th></tr>';
+  for (const r of rows) {
+    const tr = el('tr'), m = r.m;
+    const name = r.node + (isMember.has(r.node) ? '' : ' (spare)');
+    if (r.error || !m) { tr.append(cell(name), errCell(r.error ?? '–', isMember.has(r.node) ? 'bad' : '')); table.append(tr); continue; }
+    if (!m.running) { tr.append(cell(name), cell(m.broker_id, 'num'), cell('not running', isMember.has(r.node) ? 'bad' : 'empty')); table.append(tr); continue; }
+    const v = voters.get(m.broker_id);
+    const role = c?.quorum_leader === m.broker_id ? 'leader' : v ? 'voter' : 'observer';
+    tr.append(cell(name), cell(m.broker_id, 'num'), cell(role),
+      cell(v ? fmt(v.lag) : '–', 'num' + (v?.lag > 1000 ? ' bad' : '')),
+      cell(v?.caught_up_ago_sec == null ? (v ? 'now' : '–') : dur(v.caught_up_ago_sec) + ' ago', 'num' + (v?.caught_up_ago_sec > 10 ? ' bad' : '')),
+      cell(fmt(m.leader_partitions), 'num'));
+    table.append(tr);
+  }
+  box.replaceChildren(head, table);
+}
+
 // --- Connection --------------------------------------------------------------
 function status(ok, text) { $('h-dot').className = 'dot ' + (ok ? 'ok' : 'bad'); $('h-conn').textContent = text; }
 
@@ -291,7 +472,14 @@ function connect() {
       document.title = 'kaft · ' + msg.node;
       if (first) msg.controllers.forEach(buildCard);
     } else if (msg.type === 'state' && hello) {
+      lastState = msg;
       render(msg);
+      renderMetrics();
+    } else if (msg.type === 'metrics') {
+      lastMetrics = msg;
+      pushing = true;
+      renderMetrics();
+      pushing = false;
     }
   };
   ws.onclose = () => { status(false, 'disconnected, retrying…'); setTimeout(connect, 1500); };

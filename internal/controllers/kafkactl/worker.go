@@ -68,6 +68,8 @@ type Worker struct {
 	proc    *exec.Cmd
 	exited  chan struct{}
 	running bool
+
+	metrics metricsState
 }
 
 func NewWorker(cfg WorkerConfig) *Worker {

@@ -65,6 +65,8 @@ type Worker struct {
 	replset bool           // proc runs in replica set mode
 	client  *driver.Client // replica set mode connection, with the monitor
 	stopMon context.CancelFunc
+
+	metrics metricsState
 }
 
 func NewWorker(cfg WorkerConfig) *Worker {
@@ -538,6 +540,22 @@ func (w *Worker) current() (*driver.Client, error) {
 	return w.client, nil
 }
 
+// session opens a freshly authenticated connection to the running local
+// mongod, for commands that need a user. The long-lived client cannot be
+// trusted for that: when a member joins by initial sync its users are
+// replaced from the primary, and mongod drops the authentication of the
+// connections that were already open.
+func (w *Worker) session(ctx context.Context) (*driver.Client, func(), error) {
+	if _, err := w.current(); err != nil {
+		return nil, nil, err
+	}
+	c, err := w.connect(ctx, w.localAddr(), true, nil)
+	if err != nil {
+		return nil, nil, fmt.Errorf("connect to mongod: %w", err)
+	}
+	return c, func() { _ = c.Disconnect(context.Background()) }, nil
+}
+
 // rsConfig is the part of the replica set config this program edits; every
 // other field is carried through unchanged.
 type rsConfig struct {
@@ -604,10 +622,11 @@ const (
 // same path a later repair takes, and it does not depend on the other nodes
 // being empty.
 func (w *Worker) initiate(ctx context.Context, members []string) error {
-	c, err := w.current()
+	c, done, err := w.session(ctx)
 	if err != nil {
 		return err
 	}
+	defer done()
 	err = c.Database("admin").RunCommand(ctx, bson.D{{Key: "replSetInitiate", Value: bson.D{
 		{Key: "_id", Value: w.cfg.ReplSet},
 		{Key: "members", Value: bson.A{bson.D{{Key: "_id", Value: 0}, {Key: "host", Value: w.cfg.Addr}}}},
@@ -643,11 +662,14 @@ func (w *Worker) reconfig(ctx context.Context, members []string, force bool) err
 	if len(members) == 0 {
 		return errors.New("reconfig without members")
 	}
-	c, err := w.current()
+	if mon, err := w.current(); err == nil {
+		defer w.refreshStatus(ctx, mon)
+	}
+	c, done, err := w.session(ctx)
 	if err != nil {
 		return err
 	}
-	defer w.refreshStatus(ctx, c)
+	defer done()
 
 	admin := c.Database("admin")
 	deadline := time.Now().Add(5 * time.Minute)
