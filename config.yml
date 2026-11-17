@@ -43,6 +43,16 @@ time:
   # service: NTP
   # jump_threshold: 2s   # an external source moving this much...
   # jump_window: 10s     # ...within this time is no longer followed
+# DNS server on every node. Names in the zone: <node id>.service,
+# <controller><n>.service (n-th worker of that controller in node order,
+# e.g. mongo1), <controller>.service (all its workers) and each node's
+# dns_names. Other names go to the forwarders. Per node: dns_listen overrides
+# listen, ip overrides the address the names resolve to.
+# dns:
+#   listen: ":53"
+#   zone: service
+#   ttl: 10s
+#   forward: [8.8.8.8]
 # Each node has roles (default: both):
 #   server: runs raft and every enabled controller; counts for
 #           expected_bootstrap and the quorum. Needs raft_addr.

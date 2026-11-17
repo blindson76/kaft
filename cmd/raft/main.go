@@ -41,7 +41,11 @@ func main() {
 	if cfg.Time.StateFile != "" {
 		registerTime(cluster, nodeID, cfg)
 	}
-	cluster.Start(context.Background())
+	ctx := context.Background()
+	if err := internal.StartDNS(ctx, cfg, nodeID); err != nil {
+		log.Fatalf("dns: %v", err)
+	}
+	cluster.Start(ctx)
 	select {}
 }
 

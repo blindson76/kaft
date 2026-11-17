@@ -49,6 +49,27 @@ type NodeConfig struct {
 	// NTPAddr is the address the node's ntpd is reached at by the other
 	// nodes. Defaults to the host of RaftAddr, or of HTTPAddr.
 	NTPAddr string `yaml:"ntp_addr"`
+	// IP is the address the node's DNS names resolve to. Defaults to the
+	// host of RaftAddr, or of HTTPAddr.
+	IP string `yaml:"ip"`
+	// DNSListen overrides dns.listen for this node.
+	DNSListen string `yaml:"dns_listen"`
+	// DNSNames are extra names for this node in the DNS zone.
+	DNSNames []string `yaml:"dns_names"`
+}
+
+// DNSConfig configures the DNS server every node runs. It is enabled when
+// Listen is set.
+type DNSConfig struct {
+	// Listen is the address the server listens on, UDP and TCP, e.g. ":53".
+	Listen string `yaml:"listen"`
+	// Zone is the domain the names live in. Defaults to "service".
+	Zone string `yaml:"zone"`
+	// TTL of the answers. Defaults to 10s.
+	TTL time.Duration `yaml:"ttl"`
+	// Forward lists DNS servers (host or host:port) that names outside the
+	// zone are passed on to, in order. Empty: such queries are refused.
+	Forward []string `yaml:"forward"`
 }
 
 // TimeConfig configures the time controller and its workers. The controller
@@ -138,6 +159,7 @@ type ClusterConfig struct {
 	Mongo             MongoConfig  `yaml:"mongo"`
 	Kafka             KafkaConfig  `yaml:"kafka"`
 	Time              TimeConfig   `yaml:"time"`
+	DNS               DNSConfig    `yaml:"dns"`
 }
 
 // Controller names, as used in NodeConfig.Controllers. They match the names
