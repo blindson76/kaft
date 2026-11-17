@@ -5,7 +5,7 @@ import (
 	"testing"
 )
 
-var topo = Topology{Size: 3, Addrs: map[string]string{
+var topo = Topology{Min: 3, Max: 3, Addrs: map[string]string{
 	"n1": "h1:1", "n2": "h2:1", "n3": "h3:1", "n4": "h4:1", "n5": "h5:1", "n6": "h6:1",
 }}
 
@@ -173,33 +173,33 @@ func TestFormPlanIgnoresDeadNodes(t *testing.T) {
 	}
 }
 
-func TestRepairPlan(t *testing.T) {
+func TestResizePlanReplaces(t *testing.T) {
 	d := data(map[string]Report{
 		"n1": fresh(), "n2": fresh(), "n3": fresh(),
 		"n4": member("OLD", 1, 1, 2, "h4:1"), "n5": fresh(),
 	})
 	d.Members = []string{"n1", "n2", "n3"}
 
-	if _, ok := repairPlan(d, topo); ok {
+	if _, ok := resizePlan(d, topo); ok {
 		t.Fatal("repair planned although every member is alive")
 	}
 
 	d.Alive["n2"] = false
-	got, ok := repairPlan(d, topo)
+	got, ok := resizePlan(d, topo)
 	want := Plan{Members: []string{"n1", "n3", "n5"}, Start: []string{"n5"}, Stop: []string{"n2"}, Mode: ModeReconfig}
 	if !ok || !samePlan(got, want) {
 		t.Fatalf("fresh spare preferred:\n got %+v\nwant %+v", got, want)
 	}
 
 	d.Alive["n5"] = false
-	got, ok = repairPlan(d, topo)
+	got, ok = resizePlan(d, topo)
 	want = Plan{Members: []string{"n1", "n3", "n4"}, Wipe: []string{"n4"}, Start: []string{"n4"}, Stop: []string{"n2"}, Mode: ModeReconfig}
 	if !ok || !samePlan(got, want) {
 		t.Fatalf("non-fresh spare is wiped:\n got %+v\nwant %+v", got, want)
 	}
 
 	d.Alive["n4"] = false
-	if _, ok := repairPlan(d, topo); ok {
+	if _, ok := resizePlan(d, topo); ok {
 		t.Fatal("repair planned without a spare")
 	}
 
@@ -207,7 +207,7 @@ func TestRepairPlan(t *testing.T) {
 	if !d.quorumLost() {
 		t.Fatal("quorum loss not detected with 1 of 3 members alive")
 	}
-	if _, ok := repairPlan(d, topo); ok {
+	if _, ok := resizePlan(d, topo); ok {
 		t.Fatal("repair planned without a majority")
 	}
 }

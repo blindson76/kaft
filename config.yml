@@ -3,12 +3,16 @@ mongo:
   bin: C:\Users\ubozkurt\Downloads\mongodb-windows-x86_64-8.0.9\mongodb-win32-x86_64-windows-8.0.9\bin\cmongod.exe
   # data_dir: defaults to <temp>/kaft-mongo, one sub-directory per node
   replset: rs0
-  members: 3
+  # Replica set size. Formed once min_members mongo nodes report; grows into
+  # spare mongo nodes up to max_members (at most 7; default: every mongo
+  # node). Dead members are removed only while min_members remain.
+  min_members: 3
+  max_members: 4
   user: admin
   password: "123"
   args: ["--wiredTigerCacheSizeGB", "0.25"]
   # Forming the replica set waits this long for mongo nodes that join late,
-  # so the most up-to-date data is not missed. Starts once `members` nodes
+  # so the most up-to-date data is not missed. Starts once min_members nodes
   # have reported; ends early once every mongo node has.
   decision_window: 30s
 kafka:

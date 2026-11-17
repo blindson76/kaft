@@ -1,8 +1,10 @@
 package main
 
 import (
+	"cmp"
 	"context"
 	"flag"
+	"log"
 	"os"
 	"path/filepath"
 	"strings"
@@ -60,15 +62,13 @@ func registerMongo(cluster *internal.Cluster, nodeID string, cfg *internal.Clust
 	if m.ReplSet == "" {
 		m.ReplSet = "rs0"
 	}
-	if m.Members == 0 {
-		m.Members = cfg.ExpectedBootstrap
-	}
 	if m.User == "" {
 		m.User, m.Password = "admin", "123"
 	}
 
 	workers := cfg.WorkersOf(internal.ControllerMongo)
-	topology := mongoctl.Topology{Size: m.Members, Addrs: map[string]string{}, Window: m.DecisionWindow}
+	minSize, maxSize := mongoSizes(m, cfg.ExpectedBootstrap, len(workers))
+	topology := mongoctl.Topology{Min: minSize, Max: maxSize, Addrs: map[string]string{}, Window: m.DecisionWindow}
 	for _, n := range workers {
 		topology.Addrs[n.ID] = n.MongoAddr
 	}
@@ -172,4 +172,30 @@ func registerTime(cluster *internal.Cluster, nodeID string, cfg *internal.Cluste
 	for pattern, handler := range timectl.Routes(cluster.Submit) {
 		cluster.Handle(pattern, handler)
 	}
+}
+
+// maxVoters is MongoDB's limit on voting members in a replica set.
+const maxVoters = 7
+
+// mongoSizes resolves the smallest and largest replica set from the config;
+// see MongoConfig. candidates is the number of mongo nodes.
+func mongoSizes(m internal.MongoConfig, expected, candidates int) (int, int) {
+	minSize, maxSize := m.MinMembers, m.MaxMembers
+	if minSize == 0 {
+		minSize = cmp.Or(m.Members, expected)
+	}
+	if maxSize == 0 {
+		maxSize = cmp.Or(m.Members, min(candidates, maxVoters))
+	}
+	switch {
+	case minSize < 1:
+		log.Fatalf("mongo: min_members must be at least 1")
+	case maxSize < minSize:
+		log.Fatalf("mongo: max_members (%d) is smaller than min_members (%d)", maxSize, minSize)
+	case maxSize > maxVoters:
+		log.Fatalf("mongo: max_members (%d) is above %d, MongoDB's limit of voting members", maxSize, maxVoters)
+	case minSize > candidates:
+		log.Fatalf("mongo: min_members (%d) is more than the %d mongo nodes in the config", minSize, candidates)
+	}
+	return minSize, maxSize
 }

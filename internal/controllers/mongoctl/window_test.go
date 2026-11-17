@@ -17,7 +17,7 @@ type windowRig struct {
 }
 
 func newWindowRig(t *testing.T, window time.Duration) *windowRig {
-	topo := Topology{Size: 3, Window: window, Addrs: map[string]string{
+	topo := Topology{Min: 3, Max: 3, Window: window, Addrs: map[string]string{
 		"n1": "h1:1", "n2": "h2:1", "n3": "h3:1", "n4": "h4:1",
 	}}
 	r := &windowRig{t: t, rt: control.NewRuntime(), c: NewController(topo)}

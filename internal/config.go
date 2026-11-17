@@ -108,15 +108,22 @@ type MongoConfig struct {
 	DataDir string `yaml:"data_dir"`
 	// ReplSet is the replica set name. Defaults to rs0.
 	ReplSet string `yaml:"replset"`
-	// Members is how many nodes the replica set should have. Defaults to
-	// expected_bootstrap.
+	// MinMembers is the smallest replica set: forming one waits for this
+	// many mongo nodes, and dead members are removed only while at least
+	// this many remain. MaxMembers is the largest: a running set grows into
+	// spare mongo nodes up to it (at most 7). Defaults: MinMembers is
+	// Members, else expected_bootstrap; MaxMembers is Members if set, else
+	// every mongo node.
+	MinMembers int `yaml:"min_members"`
+	MaxMembers int `yaml:"max_members"`
+	// Members sets both sizes at once: a replica set of fixed size.
 	Members  int    `yaml:"members"`
 	User     string `yaml:"user"`
 	Password string `yaml:"password"`
 	// Args are extra mongod command line arguments.
 	Args []string `yaml:"args"`
 	// DecisionWindow is how long forming the replica set waits for
-	// candidates that join late (e.g. "30s"). It starts once `members` nodes
+	// candidates that join late (e.g. "30s"). It starts once MinMembers nodes
 	// have reported and ends early once every mongo node has. Zero: decide as
 	// soon as the nodes that are up have.
 	DecisionWindow time.Duration `yaml:"decision_window"`

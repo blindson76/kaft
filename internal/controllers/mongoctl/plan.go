@@ -65,6 +65,10 @@ type Data struct {
 	Round        uint64 `json:"round"`
 	WindowClosed bool   `json:"window_closed"`
 	Forced       bool   `json:"forced,omitempty"`
+	// Rejected holds spare nodes that failed to join the running set, with
+	// the probe they failed with. They are not tried again until they report
+	// a new probe or the retry delay has passed.
+	Rejected map[string]string `json:"rejected,omitempty"`
 }
 
 func (d Data) Clone() Data {
@@ -72,6 +76,7 @@ func (d Data) Clone() Data {
 	d.Reports = maps.Clone(d.Reports)
 	d.Members = slices.Clone(d.Members)
 	d.Await = maps.Clone(d.Await)
+	d.Rejected = maps.Clone(d.Rejected)
 	d.Plan.Members = slices.Clone(d.Plan.Members)
 	d.Plan.Wipe = slices.Clone(d.Plan.Wipe)
 	d.Plan.Start = slices.Clone(d.Plan.Start)
@@ -81,13 +86,18 @@ func (d Data) Clone() Data {
 
 // Topology is the static part of the picture: identical on every node.
 type Topology struct {
-	// Size is how many members the replica set should have.
-	Size int
+	// Min is the smallest replica set: forming one waits for this many
+	// reports, and dead members are removed from a running set only as long
+	// as at least Min members remain.
+	Min int
+	// Max is the largest replica set: a running set grows into spare nodes
+	// until it has Max members. At most 7, MongoDB's limit of voting members.
+	Max int
 	// Addrs maps node ID to its mongod host:port. These are the candidates.
 	Addrs map[string]string
 	// Window is how long forming a replica set waits for candidates that join
 	// late, so the decision is made with as many reports as possible. It
-	// starts once Size candidates have reported and is cut short once every
+	// starts once Min candidates have reported and is cut short once every
 	// candidate has. Zero: decide as soon as every node that is up has
 	// reported.
 	Window time.Duration
@@ -159,11 +169,12 @@ func needsWipe(node, best Boot) bool {
 // formPlan decides which nodes form the replica set, from the probe reports of
 // the alive nodes. It is a pure function of its arguments.
 //
-// The replica set whose data is newest wins: its most up-to-date nodes are
-// selected first, then fresh nodes, and only then nodes that must be wiped.
+// It needs at least Min reports and takes up to Max members. The replica set
+// whose data is newest wins: its most up-to-date nodes are selected first,
+// then fresh nodes, and only then nodes that must be wiped.
 func formPlan(d Data, t Topology) (Plan, bool) {
 	nodes := d.reported()
-	if len(nodes) < t.Size || t.Size < 1 {
+	if len(nodes) < t.Min || t.Min < 1 {
 		return Plan{}, false
 	}
 	boot := func(n string) Boot { return d.Reports[n].Boot }
@@ -199,13 +210,13 @@ func formPlan(d Data, t Topology) (Plan, bool) {
 	p := Plan{}
 	for _, group := range [][]string{usable, fresh} {
 		for _, n := range group {
-			if len(p.Members) < t.Size {
+			if len(p.Members) < t.Max {
 				p.Members = append(p.Members, n)
 			}
 		}
 	}
 	for _, n := range wipe {
-		if len(p.Members) < t.Size {
+		if len(p.Members) < t.Max {
 			p.Members = append(p.Members, n)
 			p.Wipe = append(p.Wipe, n)
 		}
@@ -262,28 +273,21 @@ func (d Data) primary(members []string) string {
 	return ""
 }
 
-// repairPlan replaces dead members of a running replica set with spare nodes.
-// It applies while the set still has a majority, so the change can go through
-// the primary.
-//
-// A spare that is not fresh is wiped. Unlike formation there is no fixed oplog
-// position to compare against, because the running set keeps writing.
-func repairPlan(d Data, t Topology) (Plan, bool) {
-	alive := d.aliveMembers()
-	if len(alive) == len(d.Members) || d.quorumLost() {
-		return Plan{}, false
-	}
-	var spares []string
+// spares returns the alive nodes that have reported and are not members,
+// fresh ones first (they need no wipe), then by ID. Rejected nodes are left
+// out until they report a new probe.
+func (d Data) spares() []string {
+	var out []string
 	for _, n := range d.reported() {
-		if !slices.Contains(d.Members, n) {
-			spares = append(spares, n)
+		if slices.Contains(d.Members, n) {
+			continue
 		}
+		if probe, ok := d.Rejected[n]; ok && probe == d.Reports[n].Boot.ProbeID {
+			continue
+		}
+		out = append(out, n)
 	}
-	if len(spares) == 0 {
-		return Plan{}, false
-	}
-	// Fresh spares first: they need no wipe.
-	slices.SortStableFunc(spares, func(a, b string) int {
+	slices.SortStableFunc(out, func(a, b string) int {
 		fa, fb := d.Reports[a].Boot.State == StateFresh, d.Reports[b].Boot.State == StateFresh
 		switch {
 		case fa && !fb:
@@ -293,10 +297,27 @@ func repairPlan(d Data, t Topology) (Plan, bool) {
 		}
 		return cmp.Compare(a, b)
 	})
+	return out
+}
 
-	p := Plan{Members: alive, Mode: ModeReconfig}
-	for _, n := range spares {
-		if len(p.Members) >= t.Size {
+// resizePlan keeps a running replica set between Min and Max members:
+//
+//   - spare nodes are added while the set has fewer than Max members, which
+//     both replaces dead members and grows a healthy set;
+//   - dead members are removed, but only as long as at least Min members
+//     remain; the ones kept stay in the config and can come back.
+//
+// Healthy members are never removed. It applies while the set has a majority,
+// so the change can go through the primary. A spare that is not fresh is
+// wiped: unlike formation there is no fixed oplog position to compare
+// against, because the running set keeps writing.
+func resizePlan(d Data, t Topology) (Plan, bool) {
+	if len(d.Members) == 0 || d.quorumLost() {
+		return Plan{}, false
+	}
+	p := Plan{Members: d.aliveMembers(), Mode: ModeReconfig}
+	for _, n := range d.spares() {
+		if len(p.Members) >= t.Max {
 			break
 		}
 		p.Members = append(p.Members, n)
@@ -306,9 +327,17 @@ func repairPlan(d Data, t Topology) (Plan, bool) {
 		}
 	}
 	for _, n := range d.Members {
+		if !d.Alive[n] && len(p.Members) < t.Min {
+			p.Members = append(p.Members, n)
+		}
+	}
+	for _, n := range d.Members {
 		if !slices.Contains(p.Members, n) {
 			p.Stop = append(p.Stop, n)
 		}
+	}
+	if len(p.Start) == 0 && len(p.Stop) == 0 {
+		return Plan{}, false
 	}
 	return p, true
 }

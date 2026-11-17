@@ -28,6 +28,9 @@ const (
 	electTimeout     = 90 * time.Second
 	configureTimeout = 6 * time.Minute
 	resetTimeout     = 90 * time.Second
+	// spareRetry is how long a spare that failed to join is left alone
+	// before it is tried again with the same probe.
+	spareRetry = 2 * time.Minute
 )
 
 func orderKey(kind, node string) string { return kind + "@" + node }
@@ -73,7 +76,7 @@ func stepFailed(d Data) bool { return len(d.Await) == 0 && d.Failed }
 //		     ▲                       │            │            │              │            │
 //		     └──────── resetting ◀───┴────────────┴────────────┴──────────────┴────────────┘
 //
-//	  - collecting: wait until enough nodes for a replica set (Topology.Size)
+//	  - collecting: wait until enough nodes for a replica set (Topology.Min)
 //	    have reported.
 //	  - deciding: the decision window (Topology.Window) runs, so candidates
 //	    that join late are not left out; then decide (formPlan). It ends early
@@ -83,7 +86,8 @@ func stepFailed(d Data) bool { return len(d.Await) == 0 && d.Failed }
 //	  - starting: start mongod on the nodes of the plan.
 //	  - electing: wait for the existing replica set to elect a primary.
 //	  - configuring: initiate / reconfigure to the planned member set.
-//	  - monitoring: steady state; replaces dead members, restarts returning ones.
+//	  - monitoring: steady state; keeps the set between Topology.Min and
+//	    Topology.Max members (resizePlan) and restarts returning ones.
 //	  - resetting: something failed or the set lost its majority. Stop every
 //	    mongod, which probes the data again, and decide from scratch.
 //
@@ -172,7 +176,7 @@ func NewController(t Topology, requires ...control.Requirement) control.Controll
 		}
 		tr.Assign(func(d Data) Data {
 			log.Printf("[mongo] resetting: %s", why)
-			d.Plan, d.Members = Plan{}, nil
+			d.Plan, d.Members, d.Rejected = Plan{}, nil, nil
 			// Old reports describe data that has moved on since; planning
 			// waits for the ones the stop orders produce.
 			d.Reports = map[string]Report{}
@@ -203,6 +207,17 @@ func NewController(t Topology, requires ...control.Requirement) control.Controll
 		on().Guard(func(d Data) bool { return cond(d) && len(d.Members) > 0 }).
 			Assign(func(d Data) Data {
 				log.Printf("[mongo] plan abandoned: %s", why)
+				// The nodes it was adding are not tried again right away,
+				// or a node that cannot join would be retried in a loop.
+				for _, n := range d.Plan.Members {
+					if !slices.Contains(d.Members, n) {
+						if d.Rejected == nil {
+							d.Rejected = map[string]string{}
+						}
+						d.Rejected[n] = d.Reports[n].Boot.ProbeID
+						log.Printf("[mongo] %s left out for now", n)
+					}
+				}
 				d.Plan, d.Await, d.Failed = Plan{}, nil, false
 				return d
 			}).
@@ -228,7 +243,7 @@ func NewController(t Topology, requires ...control.Requirement) control.Controll
 		State("collecting", func(sb *builder) {
 			track(sb)
 			// The decision window opens once a replica set could be formed.
-			sb.Always().Guard(func(d Data) bool { return len(d.reported()) >= t.Size }).
+			sb.Always().Guard(func(d Data) bool { return len(d.reported()) >= t.Min }).
 				Assign(func(d Data) Data {
 					d.Round++
 					d.WindowClosed, d.Forced = false, false
@@ -241,9 +256,9 @@ func NewController(t Topology, requires ...control.Requirement) control.Controll
 		}).
 		State("deciding", func(sb *builder) {
 			track(sb)
-			sb.Always().Guard(func(d Data) bool { return len(d.reported()) < t.Size }).
+			sb.Always().Guard(func(d Data) bool { return len(d.reported()) < t.Min }).
 				Assign(func(d Data) Data {
-					log.Printf("[mongo] fewer than %d candidates left; decision window cancelled", t.Size)
+					log.Printf("[mongo] fewer than %d candidates left; decision window cancelled", t.Min)
 					return d
 				}).
 				GoTo("collecting")
@@ -346,8 +361,16 @@ func NewController(t Topology, requires ...control.Requirement) control.Controll
 		State("monitoring", func(sb *builder) {
 			track(sb)
 			reset(sb.Always().Guard(Data.quorumLost), "replica set lost its majority")
-			adoptPlan(sb.Always(), func(d Data) (Plan, bool) { return repairPlan(d, t) })
+			adoptPlan(sb.Always(), func(d Data) (Plan, bool) { return resizePlan(d, t) })
 			adoptPlan(sb.Always(), rejoinPlan)
+			// Rejected spares get another chance after a while.
+			sb.After(spareRetry).Raise("spares.retry")
+			sb.On("spares.retry").Guard(func(d Data) bool { return len(d.Rejected) > 0 }).
+				Assign(func(d Data) Data {
+					d.Rejected = nil
+					return d
+				}).
+				GoTo("monitoring")
 		}).
 		State("resetting", func(sb *builder) {
 			track(sb)
