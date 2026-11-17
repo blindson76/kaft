@@ -1,6 +1,7 @@
 package mongoctl
 
 import (
+	"cmp"
 	"context"
 	"crypto/rand"
 	"encoding/hex"
@@ -19,6 +20,7 @@ import (
 	"time"
 
 	"example.com/dstate/internal/control"
+	"example.com/dstate/internal/util"
 	"go.mongodb.org/mongo-driver/v2/bson"
 	"go.mongodb.org/mongo-driver/v2/event"
 	driver "go.mongodb.org/mongo-driver/v2/mongo"
@@ -52,6 +54,12 @@ type WorkerConfig struct {
 type Worker struct {
 	cfg WorkerConfig
 
+	// life ends with Close; the worker's own goroutines (the first probe,
+	// the topology monitor) run on it and bg tracks them.
+	life   context.Context
+	cancel context.CancelFunc
+	bg     sync.WaitGroup
+
 	// ops serializes the probe and the orders: one mongod, one operation.
 	ops  sync.Mutex
 	once sync.Once
@@ -70,7 +78,8 @@ type Worker struct {
 }
 
 func NewWorker(cfg WorkerConfig) *Worker {
-	return &Worker{cfg: cfg, status: Status{Role: RoleStopped}}
+	life, cancel := context.WithCancel(context.Background())
+	return &Worker{cfg: cfg, life: life, cancel: cancel, status: Status{Role: RoleStopped}}
 }
 
 func (w *Worker) Name() string { return Name }
@@ -80,11 +89,15 @@ func (w *Worker) Name() string { return Name }
 // topology events, so calling it often is free.
 func (w *Worker) Probe(ctx context.Context) (any, error) {
 	w.once.Do(func() {
-		go func() {
+		// The first probe outlives this call (it starts and stops mongod),
+		// so it runs on the worker's lifetime, not on ctx.
+		w.bg.Go(func() {
 			w.ops.Lock()
 			defer w.ops.Unlock()
-			w.probe(context.Background())
-		}()
+			if w.life.Err() == nil {
+				w.probe(w.life)
+			}
+		})
 	})
 	w.mu.Lock()
 	defer w.mu.Unlock()
@@ -99,6 +112,9 @@ func (w *Worker) Probe(ctx context.Context) (any, error) {
 func (w *Worker) Execute(ctx context.Context, order control.Order) error {
 	w.ops.Lock()
 	defer w.ops.Unlock()
+	if err := cmp.Or(w.life.Err(), ctx.Err()); err != nil {
+		return err
+	}
 
 	switch order.Kind {
 	case OrderStart:
@@ -160,7 +176,7 @@ func (w *Worker) probe(ctx context.Context) Boot {
 }
 
 func (w *Worker) inspect(ctx context.Context, b *Boot) error {
-	if err := w.startProc(false); err != nil {
+	if err := w.startProc(ctx, false); err != nil {
 		return err
 	}
 	// Without --auth every local connection has full access.
@@ -276,8 +292,9 @@ func portOpen(addr string) bool {
 	return true
 }
 
-// startProc launches mongod and waits until it accepts connections.
-func (w *Worker) startProc(replset bool) error {
+// startProc launches mongod and waits until it accepts connections, or ctx
+// ends. mongod itself is not bound to ctx: it runs until stopped.
+func (w *Worker) startProc(ctx context.Context, replset bool) error {
 	if err := os.MkdirAll(w.dbPath(), 0o755); err != nil {
 		return err
 	}
@@ -302,6 +319,7 @@ func (w *Worker) startProc(replset bool) error {
 	args = append(args, w.cfg.Args...)
 
 	cmd := exec.Command(w.cfg.Bin, args...)
+	util.OwnProcessGroup(cmd)
 	if err := cmd.Start(); err != nil {
 		return fmt.Errorf("start mongod: %w", err)
 	}
@@ -325,6 +343,8 @@ func (w *Worker) startProc(replset bool) error {
 	deadline := time.After(90 * time.Second)
 	for !portOpen(w.localAddr()) {
 		select {
+		case <-ctx.Done():
+			return ctx.Err()
 		case <-exited:
 			return errors.New("mongod exited during startup (see mongod.log)")
 		case <-deadline:
@@ -335,12 +355,60 @@ func (w *Worker) startProc(replset bool) error {
 	return nil
 }
 
+// handoverWait is how long a primary that is shut down with the node waits for
+// a secondary to catch up, so it can step down without losing writes.
+const handoverWait = 10 * time.Second
+
+// quiesceWait is how long a member that is shut down with the node keeps
+// telling clients it is going away, so they move off before it closes their
+// connections; forcedWait bounds a forced shutdown's own attempt to step down.
+// mongod's default for both is 15 seconds.
+const (
+	quiesceWait = 2 * time.Second
+	forcedWait  = time.Second
+)
+
 // stop shuts down mongod: the one this worker started, or one left behind by
-// a previous run of this program on the same port.
-func (w *Worker) stop() {
+// a previous run of this program on the same port. It is part of the probe and
+// of orders, and always runs to the end: it is not cut short by their context,
+// since a half-stopped mongod is worse than a slow order.
+func (w *Worker) stop() { w.halt(context.Background(), false) }
+
+// Close implements control.Closer: it ends the worker's goroutines and shuts
+// mongod down with the node. A primary first hands over to a secondary, so
+// the replica set elects a new primary at once and keeps its writes. mongod is
+// killed if ctx ends first.
+func (w *Worker) Close(ctx context.Context) error {
+	w.cancel()
+	w.bg.Wait()
+	w.ops.Lock()
+	defer w.ops.Unlock()
+
+	w.metrics.mu.Lock()
+	w.metrics.drop()
+	w.metrics.mu.Unlock()
+
+	w.mu.Lock()
+	running := w.proc != nil
+	w.mu.Unlock()
+	if running {
+		log.Printf("[mongo] shutting down mongod")
+	}
+	w.halt(ctx, true)
+	return nil
+}
+
+// halt stops mongod. With handover a primary first steps down, waiting up to
+// handoverWait for a secondary to catch up, and a replica set member is shut
+// down without force, with a short quiesce period for its clients. Whatever is
+// still running after that is shut down with force, and killed when that does
+// not work or ctx ends.
+func (w *Worker) halt(ctx context.Context, handover bool) {
 	w.mu.Lock()
 	cmd, exited, replset := w.proc, w.exited, w.replset
 	client, stopMon := w.client, w.stopMon
+	// With nobody to hand over to, the primary does not wait for a catch-up.
+	primary := w.status.Role == RolePrimary && len(w.status.Hosts) > 1
 	w.proc, w.client, w.stopMon = nil, nil, nil
 	w.status = Status{Role: RoleStopped}
 	w.mu.Unlock()
@@ -349,25 +417,70 @@ func (w *Worker) stop() {
 		stopMon()
 	}
 	if client != nil {
-		_ = client.Disconnect(context.Background())
+		_ = client.Disconnect(context.WithoutCancel(ctx))
+	}
+
+	gone := func() bool {
+		select {
+		case <-exited:
+			return true
+		default:
+			return false
+		}
+	}
+	// waitExit waits up to d for the process to exit.
+	waitExit := func(d time.Duration) bool {
+		t := time.NewTimer(d)
+		defer t.Stop()
+		select {
+		case <-exited:
+			return true
+		case <-ctx.Done():
+		case <-t.C:
+		}
+		return false
 	}
 
 	if cmd != nil {
-		w.shutdown(replset)
-		select {
-		case <-exited:
-		case <-time.After(30 * time.Second):
+		if handover && replset && !gone() {
+			// A primary steps down first, as its own step: it waits for a
+			// secondary to catch up, which is then elected at once. A
+			// shutdown command would also wait, but spend the same time in
+			// quiesce mode afterwards.
+			graceful := true
+			if primary {
+				if err := w.stepDown(ctx); err != nil {
+					log.Printf("[mongo] no handover to a secondary (%v); shutting down with force", err)
+					graceful = false
+				} else {
+					log.Printf("[mongo] stepped down; a secondary takes over")
+				}
+			}
+			// A refusal (code != 0) means it stays up. Anything else is the
+			// connection dropping as mongod exits.
+			if graceful {
+				if err := w.shutdown(ctx, true, false, quiesceWait); commandCode(err) == 0 {
+					waitExit(quiesceWait + 5*time.Second)
+				}
+			}
+		}
+		if !gone() && ctx.Err() == nil {
+			_ = w.shutdown(ctx, replset, true, forcedWait)
+			waitExit(30 * time.Second)
+		}
+		if !gone() {
+			log.Printf("[mongo] mongod did not shut down; killing it")
 			_ = cmd.Process.Kill()
 			<-exited
 		}
 	} else if portOpen(w.localAddr()) {
 		// Not ours: try both modes, then the pid file.
-		w.shutdown(true)
-		w.shutdown(false)
+		_ = w.shutdown(ctx, true, true, forcedWait)
+		_ = w.shutdown(ctx, false, true, forcedWait)
 		if raw, err := os.ReadFile(w.pidPath()); err == nil {
 			if pid, err := strconv.Atoi(strings.TrimSpace(string(raw))); err == nil {
 				if p, err := os.FindProcess(pid); err == nil {
-					time.Sleep(3 * time.Second)
+					sleep(ctx, 3*time.Second)
 					if portOpen(w.localAddr()) {
 						_ = p.Kill()
 					}
@@ -375,22 +488,58 @@ func (w *Worker) stop() {
 			}
 		}
 	}
-	for i := 0; i < 100 && portOpen(w.localAddr()); i++ {
-		time.Sleep(200 * time.Millisecond)
+	for i := 0; i < 100 && portOpen(w.localAddr()) && sleep(ctx, 200*time.Millisecond); i++ {
 	}
 }
 
-// shutdown asks mongod to exit cleanly. The connection drops while it does,
-// so the error says nothing.
-func (w *Worker) shutdown(auth bool) {
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+// sleep waits for d, or less if ctx ends; it reports whether ctx is still on.
+func sleep(ctx context.Context, d time.Duration) bool {
+	t := time.NewTimer(d)
+	defer t.Stop()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-t.C:
+		return true
+	}
+}
+
+// stepDown makes the primary step down once a secondary has caught up, waiting
+// up to handoverWait for that; it fails if none does in time.
+func (w *Worker) stepDown(ctx context.Context) error {
+	ctx, cancel := context.WithTimeout(ctx, handoverWait+10*time.Second)
+	defer cancel()
+	c, err := w.connect(ctx, w.localAddr(), true, nil)
+	if err != nil {
+		return err
+	}
+	defer c.Disconnect(context.WithoutCancel(ctx))
+	return c.Database("admin").RunCommand(ctx, bson.D{
+		// Not electable again for a minute: it is about to stop anyway.
+		{Key: "replSetStepDown", Value: 60},
+		{Key: "secondaryCatchUpPeriodSecs", Value: int(handoverWait / time.Second)},
+	}).Err()
+}
+
+// shutdown asks mongod to exit. wait is the shutdown command's timeoutSecs: a
+// primary waits that long for a secondary to catch up and steps down first
+// (without force it refuses to exit if none does), and any member then spends
+// it in quiesce mode, telling clients it is going away. The connection drops
+// while mongod exits, so an error that is not a refusal says nothing.
+func (w *Worker) shutdown(ctx context.Context, auth, force bool, wait time.Duration) error {
+	ctx, cancel := context.WithTimeout(ctx, wait+10*time.Second)
 	defer cancel()
 	c, err := w.connect(ctx, w.localAddr(), auth, nil)
 	if err != nil {
-		return
+		return err
 	}
-	defer c.Disconnect(context.Background())
-	_ = c.Database("admin").RunCommand(ctx, bson.D{{Key: "shutdown", Value: 1}, {Key: "force", Value: true}}).Err()
+	defer c.Disconnect(context.WithoutCancel(ctx))
+	cmd := bson.D{
+		{Key: "shutdown", Value: 1},
+		{Key: "force", Value: force},
+		{Key: "timeoutSecs", Value: max(int(wait/time.Second), 1)},
+	}
+	return c.Database("admin").RunCommand(ctx, cmd).Err()
 }
 
 func removeAll(dir string) error {
@@ -445,7 +594,7 @@ func (w *Worker) startReplSet(ctx context.Context) error {
 	}
 
 	w.stop()
-	if err := w.startProc(true); err != nil {
+	if err := w.startProc(ctx, true); err != nil {
 		return err
 	}
 
@@ -467,13 +616,15 @@ func (w *Worker) startReplSet(ctx context.Context) error {
 		return fmt.Errorf("connect to mongod: %w", err)
 	}
 
-	monCtx, stopMon := context.WithCancel(context.Background())
+	// The monitor lasts as long as this mongod, not this order: it ends when
+	// mongod is stopped or the worker closes.
+	monCtx, stopMon := context.WithCancel(w.life)
 	w.mu.Lock()
 	w.client, w.stopMon = c, stopMon
 	w.mu.Unlock()
 
 	w.refreshStatus(ctx, c)
-	go func() {
+	w.bg.Go(func() {
 		for {
 			select {
 			case <-monCtx.Done():
@@ -482,7 +633,7 @@ func (w *Worker) startReplSet(ctx context.Context) error {
 				w.refreshStatus(monCtx, c)
 			}
 		}
-	}()
+	})
 	log.Printf("[mongo] mongod started as replica set member")
 	return nil
 }
@@ -643,7 +794,9 @@ func (w *Worker) initiate(ctx context.Context, members []string) error {
 		if time.Now().After(deadline) {
 			return errors.New("node did not become primary after replSetInitiate")
 		}
-		time.Sleep(500 * time.Millisecond)
+		if !sleep(ctx, 500*time.Millisecond) {
+			return ctx.Err()
+		}
 	}
 	log.Printf("[mongo] replica set initiated")
 	return w.reconfig(ctx, members, false)

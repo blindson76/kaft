@@ -3,6 +3,7 @@ package internal
 import (
 	"cmp"
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"net"
@@ -110,15 +111,29 @@ func newDNSServer(cfg *ClusterConfig) (*dnsServer, error) {
 
 // StartDNS runs this node's DNS server, on UDP and TCP, if the config enables
 // it. It fails if the config's names are inconsistent or the port is taken.
-func StartDNS(ctx context.Context, cfg *ClusterConfig, nodeID string) error {
+//
+// The returned function shuts the server down and waits, until ctx ends, for
+// queries in progress (a forwarded one can take a while). It is never nil.
+func StartDNS(cfg *ClusterConfig, nodeID string) (func(ctx context.Context) error, error) {
+	var servers []*dns.Server
+	shutdown := func(ctx context.Context) error {
+		var errs []error
+		for _, srv := range servers {
+			if err := srv.ShutdownContext(ctx); err != nil {
+				errs = append(errs, fmt.Errorf("dns %s: %w", srv.Net, err))
+			}
+		}
+		return errors.Join(errs...)
+	}
+
 	self, _ := cfg.Node(nodeID)
 	listen := cmp.Or(self.DNSListen, cfg.DNS.Listen)
 	if listen == "" {
-		return nil
+		return shutdown, nil
 	}
 	s, err := newDNSServer(cfg)
 	if err != nil {
-		return err
+		return shutdown, err
 	}
 	for _, network := range []string{"udp", "tcp"} {
 		srv := &dns.Server{Addr: listen, Net: network, Handler: s}
@@ -126,12 +141,10 @@ func StartDNS(ctx context.Context, cfg *ClusterConfig, nodeID string) error {
 		srv.NotifyStartedFunc = func() { started <- nil }
 		go func() { started <- srv.ListenAndServe() }()
 		if err := <-started; err != nil {
-			return fmt.Errorf("dns %s %s: %w", network, listen, err)
+			_ = shutdown(context.Background()) // the one already started
+			return shutdown, fmt.Errorf("dns %s %s: %w", network, listen, err)
 		}
-		go func() {
-			<-ctx.Done()
-			_ = srv.Shutdown()
-		}()
+		servers = append(servers, srv)
 	}
 	names := make([]string, 0, len(s.records))
 	for name := range s.records {
@@ -139,7 +152,7 @@ func StartDNS(ctx context.Context, cfg *ClusterConfig, nodeID string) error {
 	}
 	slices.Sort(names)
 	log.Printf("DNS server on %s for zone %s: %s", listen, strings.TrimSuffix(s.zone, "."), strings.Join(names, " "))
-	return nil
+	return shutdown, nil
 }
 
 func (s *dnsServer) inZone(name string) bool {

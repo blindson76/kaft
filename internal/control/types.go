@@ -134,6 +134,10 @@ type Controller interface {
 	Deliver(ev Event)
 	// Activate starts leader-only services (timers, invokes). Idempotent.
 	Activate()
+	// Stop ends the controller's own goroutines (timers, invokes) when the
+	// node shuts down, waiting for them until ctx ends. No event is delivered
+	// afterwards.
+	Stop(ctx context.Context) error
 	Snapshot() (json.RawMessage, error)
 	Restore(json.RawMessage) error
 	// States lists the active states, for inspection.
@@ -176,6 +180,18 @@ type Worker interface {
 	// idempotent: the same order can be delivered again after a retry or a
 	// restart, so check the local state before acting.
 	Execute(ctx context.Context, order Order) error
+}
+
+// Closer is a Worker that holds local resources: a service process,
+// connections, goroutines of its own. Close is called once when the node shuts
+// down, after the agent has stopped, so no Probe or Execute runs during or
+// after it. It should stop the local service cleanly, release everything, and
+// cut corners once ctx ends.
+//
+// The worker's own goroutines must not outlive Close; that is why they run on
+// a context Close cancels, never on context.Background().
+type Closer interface {
+	Close(ctx context.Context) error
 }
 
 // MetricsWorker is a Worker that also offers live metrics of its service, for

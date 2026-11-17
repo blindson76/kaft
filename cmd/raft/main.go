@@ -3,11 +3,15 @@ package main
 import (
 	"cmp"
 	"context"
+	"errors"
 	"flag"
 	"log"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"strings"
+	"syscall"
+	"time"
 
 	"example.com/dstate/internal"
 	"example.com/dstate/internal/control"
@@ -17,16 +21,22 @@ import (
 )
 
 func main() {
-
 	var nodeID string = ""
 	flag.StringVar(&nodeID, "node-id", "node-1", "node id")
 	configPath := flag.String("config", "config.yml", "config file")
+	shutdownTimeout := flag.Duration("shutdown-timeout", time.Minute,
+		"how long a shutdown may take; services still running then are killed")
 	flag.Parse()
 	cfg, err := internal.ParseConfig(*configPath)
 	if err != nil {
-		panic(err)
+		log.Fatalf("config: %v", err)
 	}
-	// log.Printf("Config:%+v\n", cfg)
+
+	// The node runs until interrupted: Ctrl+C, or SIGTERM, which is also what
+	// Windows sends when the console is closed, the user logs off or the
+	// machine shuts down.
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
 
 	cluster := internal.NewCluster(nodeID, cfg)
 	// Each service is one controller (replicated decisions, on the servers)
@@ -41,12 +51,30 @@ func main() {
 	if cfg.Time.StateFile != "" {
 		registerTime(cluster, nodeID, cfg)
 	}
-	ctx := context.Background()
-	if err := internal.StartDNS(ctx, cfg, nodeID); err != nil {
+
+	stopDNS, err := internal.StartDNS(cfg, nodeID)
+	if err != nil {
 		log.Fatalf("dns: %v", err)
 	}
-	cluster.Start(ctx)
-	select {}
+	if err := cluster.Start(ctx); err != nil {
+		log.Printf("start: %v", err)
+		stop() // shut down what did start
+	}
+
+	<-ctx.Done()
+	// From here a second signal ends the process at once, without waiting
+	// for the services to stop.
+	stop()
+	log.Printf("Shutting down (at most %v; interrupt again to quit at once)", *shutdownTimeout)
+	sctx, cancel := context.WithTimeout(context.Background(), *shutdownTimeout)
+	defer cancel()
+	// DNS stops last: other nodes may need its answers while this one leaves.
+	err = errors.Join(cluster.Shutdown(sctx), stopDNS(sctx))
+	if err != nil {
+		log.Printf("Shutdown incomplete: %v", err)
+		os.Exit(1)
+	}
+	log.Printf("Shutdown complete")
 }
 
 // ids returns the IDs of nodes.

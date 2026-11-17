@@ -1,6 +1,7 @@
 package control
 
 import (
+	"context"
 	"encoding/json"
 	"slices"
 	"strings"
@@ -19,13 +20,14 @@ type fakeController struct {
 	got     []string // dependency events received, in order
 }
 
-func (f *fakeController) Name() string            { return f.name }
-func (f *fakeController) Start(Host)              {}
-func (f *fakeController) Activate()               {}
-func (f *fakeController) States() []string        { return []string{f.state} }
-func (f *fakeController) Diagram() string         { return "" }
-func (f *fakeController) Requires() []Requirement { return f.requires }
-func (f *fakeController) HasState(s string) bool  { return slices.Contains(f.states, s) }
+func (f *fakeController) Name() string               { return f.name }
+func (f *fakeController) Start(Host)                 {}
+func (f *fakeController) Activate()                  {}
+func (f *fakeController) Stop(context.Context) error { return nil }
+func (f *fakeController) States() []string           { return []string{f.state} }
+func (f *fakeController) Diagram() string            { return "" }
+func (f *fakeController) Requires() []Requirement    { return f.requires }
+func (f *fakeController) HasState(s string) bool     { return slices.Contains(f.states, s) }
 func (f *fakeController) Restore(json.RawMessage) error {
 	return nil
 }

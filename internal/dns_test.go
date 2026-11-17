@@ -6,6 +6,7 @@ import (
 	"slices"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/miekg/dns"
 )
@@ -101,11 +102,17 @@ func TestDNSServer(t *testing.T) {
 	addr := pc.LocalAddr().String()
 	pc.Close()
 	cfg.DNS.Listen = addr
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	if err := StartDNS(ctx, cfg, "s1"); err != nil {
+	stop, err := StartDNS(cfg, "s1")
+	if err != nil {
 		t.Fatal(err)
 	}
+	defer func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := stop(ctx); err != nil {
+			t.Errorf("shutdown: %v", err)
+		}
+	}()
 
 	ask := func(network, name string, qtype uint16) *dns.Msg {
 		t.Helper()

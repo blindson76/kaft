@@ -7,6 +7,7 @@ import (
 	"net"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -235,5 +236,38 @@ func TestQueryTime(t *testing.T) {
 	// Nobody there.
 	if _, err := queryTime("127.0.0.1:9", 200*time.Millisecond); err == nil {
 		t.Fatal("no error from a dead address")
+	}
+}
+
+// Close ends the watch on the external servers, which runs on the worker's
+// own lifetime, not on any probe's context.
+func TestCloseStopsWatch(t *testing.T) {
+	w, _ := testWorker(t)
+	w.cfg.Interval = 5 * time.Millisecond
+	var queries atomic.Int64
+	w.query = func(string, time.Duration) (time.Time, error) {
+		queries.Add(1)
+		return time.Now(), nil
+	}
+	if _, err := w.Probe(context.Background()); err != nil && !errors.Is(err, control.ErrNotReady) {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for queries.Load() < 3 {
+		if time.Now().After(deadline) {
+			t.Fatal("watch never ran")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if err := w.Close(ctx); err != nil {
+		t.Fatal(err)
+	}
+	after := queries.Load()
+	time.Sleep(50 * time.Millisecond)
+	if n := queries.Load(); n != after {
+		t.Fatalf("watch still querying after Close: %d more", n-after)
 	}
 }

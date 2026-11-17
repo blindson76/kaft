@@ -4,9 +4,11 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"net/url"
 	"sync"
@@ -124,7 +126,11 @@ func (c *Cluster) fetchAgentState(ctx context.Context, node string) (control.Age
 // Every node serves GET /metrics: live metrics of its workers (metrics.go).
 //
 // Both serve whatever the controllers added with Handle.
-func (c *Cluster) serveHTTP(ctx context.Context) {
+//
+// It fails if the address cannot be listened on. Requests run on contexts
+// derived from ctx, so open views and long requests end with the node;
+// Shutdown stops the server.
+func (c *Cluster) startHTTP(ctx context.Context) error {
 	mux := http.NewServeMux()
 	if c.IsServer() {
 		c.serverRoutes(mux)
@@ -146,14 +152,22 @@ func (c *Cluster) serveHTTP(ctx context.Context) {
 		mux.HandleFunc(pattern, handler)
 	}
 
-	srv := &http.Server{Addr: c.nodesMap[c.nodeID].HTTPAddr, Handler: mux}
-	go func() {
-		<-ctx.Done()
-		_ = srv.Close()
-	}()
-	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-		log.Printf("HTTP server error:%v", err)
+	addr := c.nodesMap[c.nodeID].HTTPAddr
+	ln, err := net.Listen("tcp", addr)
+	if err != nil {
+		return fmt.Errorf("http: %w", err)
 	}
+	c.srv = &http.Server{
+		Handler:           mux,
+		ReadHeaderTimeout: 10 * time.Second,
+		BaseContext:       func(net.Listener) context.Context { return ctx },
+	}
+	c.wg.Go(func() {
+		if err := c.srv.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			log.Printf("HTTP server error:%v", err)
+		}
+	})
+	return nil
 }
 
 func (c *Cluster) serverRoutes(mux *http.ServeMux) {

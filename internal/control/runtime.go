@@ -2,7 +2,9 @@ package control
 
 import (
 	"cmp"
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"maps"
@@ -254,6 +256,18 @@ func (r *Runtime) Activate() {
 	for _, c := range r.controllers {
 		c.Activate()
 	}
+}
+
+// Stop stops every controller, once nothing applies events any more (raft has
+// shut down). It waits for their goroutines until ctx ends.
+func (r *Runtime) Stop(ctx context.Context) error {
+	var errs []error
+	for _, c := range r.controllers {
+		if err := c.Stop(ctx); err != nil {
+			errs = append(errs, fmt.Errorf("stop %s: %w", c.Name(), err))
+		}
+	}
+	return errors.Join(errs...)
 }
 
 // Alive reports the replicated liveness of node.

@@ -6,6 +6,7 @@ import (
 	_ "embed"
 	"encoding/json"
 	"net/http"
+	"sync"
 	"time"
 
 	"example.com/dstate/internal/control"
@@ -68,8 +69,14 @@ func (c *Cluster) serveWS(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer conn.CloseNow()
-	// The client sends nothing; reading is only how a close is noticed.
-	ctx := conn.CloseRead(r.Context())
+	// The client sends nothing; reading is only how a close is noticed. The
+	// request context ends with the node too (see startHTTP).
+	ctx, cancel := context.WithCancel(conn.CloseRead(r.Context()))
+	var wg sync.WaitGroup
+	// Runs first of the deferred calls: the metrics poller ends before the
+	// connection is closed and the handler returns.
+	defer wg.Wait()
+	defer cancel()
 
 	send := func(v any) ([]byte, error) {
 		raw, err := json.Marshal(v)
@@ -92,7 +99,7 @@ func (c *Cluster) serveWS(w http.ResponseWriter, r *http.Request) {
 
 	// Metrics are polled from every node while this view is open, on their
 	// own goroutine so a slow node never delays the state.
-	go func() {
+	wg.Go(func() {
 		t := time.NewTicker(metricsInterval)
 		defer t.Stop()
 		for {
@@ -105,7 +112,7 @@ func (c *Cluster) serveWS(w http.ResponseWriter, r *http.Request) {
 			case <-t.C:
 			}
 		}
-	}()
+	})
 
 	changed, unsubscribe := c.rt.Subscribe()
 	defer unsubscribe()

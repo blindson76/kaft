@@ -2,7 +2,7 @@
 # ${VAR:-default} (default when unset or empty), $$ for a literal $.
 expected_bootstrap: 3
 mongo:
-  bin: C:\Users\ubozkurt\Downloads\mongodb-windows-x86_64-8.0.9\mongodb-win32-x86_64-windows-8.0.9\bin\cmongod.exe
+  bin: C:\Users\ubozkurt\Downloads\mongodb-windows-x86_64-8.0.9\mongodb-win32-x86_64-windows-8.0.9\bin\mongod.exe
   # data_dir: defaults to <temp>/kaft-mongo, one sub-directory per node
   replset: rs0
   # Replica set size. Formed once min_members mongo nodes report; grows into

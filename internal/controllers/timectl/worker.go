@@ -57,6 +57,11 @@ type Worker struct {
 	start time.Time
 	query func(server string, timeout time.Duration) (time.Time, error)
 
+	// life ends with Close; the watch runs on it and bg tracks it.
+	life   context.Context
+	cancel context.CancelFunc
+	bg     sync.WaitGroup
+
 	// ops serializes orders.
 	ops  sync.Mutex
 	once sync.Once
@@ -78,15 +83,33 @@ func NewWorker(cfg WorkerConfig) *Worker {
 	if cfg.JumpWindow <= 0 {
 		cfg.JumpWindow = 10 * time.Second
 	}
-	return &Worker{cfg: cfg, start: time.Now(), query: queryTime, sources: map[string]*source{}}
+	life, cancel := context.WithCancel(context.Background())
+	return &Worker{cfg: cfg, start: time.Now(), query: queryTime, sources: map[string]*source{}, life: life, cancel: cancel}
 }
 
 func (w *Worker) Name() string { return Name }
 
+// Close implements control.Closer: it ends the watch. ntpd and the clock are
+// left as they are; the node's time does not depend on this program running.
+func (w *Worker) Close(ctx context.Context) error {
+	w.cancel()
+	done := make(chan struct{})
+	go func() {
+		w.bg.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+		return nil
+	case <-ctx.Done():
+		return fmt.Errorf("time watch: %w", ctx.Err())
+	}
+}
+
 // Probe reports the stored state and what the watch on the external servers
-// currently says. The watch starts with the first probe.
+// currently says. The watch starts with the first probe and runs until Close.
 func (w *Worker) Probe(ctx context.Context) (any, error) {
-	w.once.Do(func() { go w.watch() })
+	w.once.Do(func() { w.bg.Go(func() { w.watch(w.life) }) })
 
 	w.mu.Lock()
 	defer w.mu.Unlock()
@@ -109,17 +132,26 @@ func (w *Worker) Probe(ctx context.Context) (any, error) {
 	return r, nil
 }
 
-// watch asks every external server for the time, forever.
-func (w *Worker) watch() {
+// watch asks every external server for the time until ctx ends.
+func (w *Worker) watch(ctx context.Context) {
+	t := time.NewTicker(w.cfg.Interval)
+	defer t.Stop()
 	for {
 		for _, server := range w.cfg.External {
+			if ctx.Err() != nil {
+				return
+			}
 			at, err := w.query(server, time.Second)
 			w.record(server, at, err)
 		}
 		w.mu.Lock()
 		w.ready = true
 		w.mu.Unlock()
-		time.Sleep(w.cfg.Interval)
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+		}
 	}
 }
 
@@ -181,6 +213,13 @@ func (w *Worker) Execute(ctx context.Context, order control.Order) error {
 
 	w.ops.Lock()
 	defer w.ops.Unlock()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+
+	// From here on ctx is not looked at: applying stops ntpd, may set the
+	// clock, and starts ntpd again. Cut short in between, the node would be
+	// left without a time service.
 
 	// An unreadable state file counts as no state; it is replaced below.
 	state, _ := w.load()

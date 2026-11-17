@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"log"
+	"sync"
 	"time"
 )
 
@@ -52,6 +53,7 @@ type Agent struct {
 	submit   SubmitFunc
 	workers  []Worker
 	interval time.Duration
+	wg       sync.WaitGroup
 }
 
 func NewAgent(node string, rt View, submit SubmitFunc, workers ...Worker) *Agent {
@@ -68,13 +70,17 @@ func NewAgent(node string, rt View, submit SubmitFunc, workers ...Worker) *Agent
 }
 
 // Run starts the announce loop and one loop per worker, and returns
-// immediately.
+// immediately. They run until ctx ends; Wait waits for them.
 func (a *Agent) Run(ctx context.Context) {
-	go a.announce(ctx)
+	a.wg.Go(func() { a.announce(ctx) })
 	for _, w := range a.workers {
-		go a.loop(ctx, w)
+		a.wg.Go(func() { a.loop(ctx, w) })
 	}
 }
+
+// Wait returns once every loop has returned after ctx ended, including any
+// order or probe that was in progress.
+func (a *Agent) Wait() { a.wg.Wait() }
 
 // caughtUp reports whether this start's EvNodeReady has been applied locally.
 func (a *Agent) caughtUp() bool {
@@ -179,7 +185,15 @@ func (a *Agent) work(ctx context.Context, w Worker, outcomes map[uint64]string) 
 		outcome, executed := outcomes[o.ID]
 		if !executed {
 			log.Printf("[%s] executing order #%d: %s", w.Name(), o.ID, o.Kind)
-			if err := w.Execute(ctx, o); err != nil {
+			err := w.Execute(ctx, o)
+			if ctx.Err() != nil {
+				// Interrupted by the node shutting down, which says nothing
+				// about the order: it stays pending and runs again after the
+				// restart (orders are idempotent).
+				log.Printf("[%s] order #%d interrupted by shutdown", w.Name(), o.ID)
+				return
+			}
+			if err != nil {
 				log.Printf("[%s] order #%d failed: %v", w.Name(), o.ID, err)
 				outcome = err.Error()
 				if outcome == "" {

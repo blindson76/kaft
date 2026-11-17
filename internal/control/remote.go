@@ -25,21 +25,25 @@ type RemoteView struct {
 
 	mu    sync.RWMutex
 	state AgentState
+	wg    sync.WaitGroup
 }
 
 func NewRemoteView(node string, fetch func(ctx context.Context, node string) (AgentState, error)) *RemoteView {
 	return &RemoteView{node: node, fetch: fetch, interval: 250 * time.Millisecond}
 }
 
-// Run keeps the view current until ctx ends. It returns immediately.
+// Run keeps the view current until ctx ends. It returns immediately; Wait
+// waits for it to finish.
 func (v *RemoteView) Run(ctx context.Context) {
-	go func() {
+	v.wg.Go(func() {
 		ticker := time.NewTicker(v.interval)
 		defer ticker.Stop()
 		failing := false
 		for {
 			s, err := v.fetch(ctx, v.node)
 			switch {
+			case ctx.Err() != nil:
+				return
 			case err == nil:
 				if failing {
 					log.Printf("Remote state reachable again")
@@ -60,8 +64,11 @@ func (v *RemoteView) Run(ctx context.Context) {
 			case <-ticker.C:
 			}
 		}
-	}()
+	})
 }
+
+// Wait returns once the loop Run started has ended.
+func (v *RemoteView) Wait() { v.wg.Wait() }
 
 // Boot implements View.
 func (v *RemoteView) Boot(node string) string {

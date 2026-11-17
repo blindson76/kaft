@@ -4,12 +4,14 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log"
 	"net"
 	"net/http"
 	"slices"
 	"strings"
+	"sync"
 	"time"
 
 	"example.com/dstate/internal/control"
@@ -86,6 +88,16 @@ type Cluster struct {
 	routes  map[string]http.HandlerFunc
 	// leader reaches the raft leader from a worker-only node.
 	leader *leaderClient
+
+	// What Start runs, for Shutdown. cancel ends the context everything runs
+	// on; wg tracks the cluster's own loops, observing the raft observer and
+	// what it starts.
+	cancel    context.CancelFunc
+	wg        sync.WaitGroup
+	observing sync.WaitGroup
+	srv       *http.Server
+	agent     *control.Agent
+	remote    *control.RemoteView
 }
 
 func NewCluster(self string, cfg *ClusterConfig) *Cluster {
@@ -294,29 +306,145 @@ func (c *Cluster) WaitNode(ctx context.Context, node string) {
 }
 
 // Start runs the node in its roles: raft and the controllers on a server, the
-// agent with its workers on a worker. On a server it returns once the cluster
-// is bootstrapped (or found to be already); everything keeps running in the
-// background until ctx ends.
-func (c *Cluster) Start(ctx context.Context) {
+// agent with its workers on a worker. It returns once everything is running;
+// it all keeps running in the background until ctx ends or Shutdown is
+// called. Call Shutdown in any case, also after Start failed: it stops
+// whatever had been started.
+func (c *Cluster) Start(ctx context.Context) error {
+	ctx, c.cancel = context.WithCancel(ctx)
 	log.Printf("Node %s roles: %s; workers: %s", c.nodeID, strings.Join(c.self.Roles, ", "), strings.Join(c.workerNames(), ", "))
 	var view control.View = c.rt
 	if c.IsServer() {
 		if err := c.rt.Validate(); err != nil {
-			log.Fatalf("invalid controller setup: %v", err)
+			return fmt.Errorf("invalid controller setup: %w", err)
 		}
-		c.startRaft(ctx)
+		if err := c.startRaft(ctx); err != nil {
+			return err
+		}
 	} else {
-		rv := control.NewRemoteView(c.nodeID, c.fetchAgentState)
-		rv.Run(ctx)
-		view = rv
+		c.remote = control.NewRemoteView(c.nodeID, c.fetchAgentState)
+		c.remote.Run(ctx)
+		view = c.remote
 	}
-	go c.serveHTTP(ctx)
+	if err := c.startHTTP(ctx); err != nil {
+		return err
+	}
 	if len(c.workers) > 0 {
-		control.NewAgent(c.nodeID, view, c.Submit, c.workers...).Run(ctx)
+		c.agent = control.NewAgent(c.nodeID, view, c.Submit, c.workers...)
+		c.agent.Run(ctx)
 	}
 	if c.IsServer() {
-		_ = c.bsManager.Start(ctx)
+		c.wg.Go(func() {
+			if err := c.bsManager.Start(ctx); err != nil && ctx.Err() == nil {
+				log.Printf("Bootstrap error:%v", err)
+			}
+		})
 	}
+	return nil
+}
+
+// Shutdown stops the node, in an order that leaves the cluster in the best
+// shape it can:
+//
+//  1. A raft leader hands leadership over, so the others have a new leader at
+//     once instead of after an election timeout.
+//  2. Everything driven by the node's context stops: the agent (an order in
+//     progress is interrupted and stays pending, to run again after the
+//     restart), the membership and forwarding loops, the web views. The HTTP
+//     endpoint stops taking requests.
+//  3. The workers close, in reverse registration order, so a service stops
+//     before the ones it depends on: each stops its local service cleanly.
+//  4. Raft shuts down, then the controllers.
+//
+// ctx bounds the whole of it; when it ends, the remaining steps are cut short
+// (a service that does not stop in time is killed) and the error says what
+// was left unfinished.
+func (c *Cluster) Shutdown(ctx context.Context) error {
+	var errs []error
+	fail := func(what string, err error) {
+		if err != nil {
+			log.Printf("Shutdown: %s: %v", what, err)
+			errs = append(errs, fmt.Errorf("%s: %w", what, err))
+		}
+	}
+
+	if c.r != nil && c.r.State() == raft.Leader {
+		c.handOverLeadership(ctx)
+	}
+
+	if c.cancel != nil {
+		c.cancel()
+	}
+	if c.srv != nil {
+		fail("http", c.srv.Shutdown(ctx))
+	}
+	fail("background loops", waitFor(ctx, func() error {
+		if c.agent != nil {
+			c.agent.Wait()
+		}
+		if c.remote != nil {
+			c.remote.Wait()
+		}
+		c.wg.Wait()
+		return nil
+	}))
+
+	for _, w := range slices.Backward(c.workers) {
+		if closer, ok := w.(control.Closer); ok {
+			log.Printf("Shutdown: closing the %s worker", w.Name())
+			fail(w.Name()+" worker", closer.Close(ctx))
+		}
+	}
+
+	if c.r != nil {
+		log.Printf("Shutdown: stopping raft")
+		fail("raft", waitFor(ctx, func() error { return c.r.Shutdown().Error() }))
+		fail("raft observer", waitFor(ctx, func() error {
+			c.observing.Wait()
+			return nil
+		}))
+	}
+	if c.IsServer() {
+		fail("controllers", c.rt.Stop(ctx))
+	}
+	return errors.Join(errs...)
+}
+
+// waitFor runs fn and waits for it until ctx ends. fn keeps running in the
+// background after that; it is for steps that cannot be interrupted.
+func waitFor(ctx context.Context, fn func() error) error {
+	done := make(chan error, 1)
+	go func() { done <- fn() }()
+	select {
+	case err := <-done:
+		return err
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+// handOverLeadership makes another server the raft leader, the first one in
+// the configuration that answers. A member that is down stays in the
+// configuration while it holds the quorum size up, so raft's own pick could be
+// a dead one. It is best effort: without it the others elect a leader after
+// the election timeout.
+func (c *Cluster) handOverLeadership(ctx context.Context) {
+	cf := c.r.GetConfiguration()
+	if cf.Error() != nil {
+		return
+	}
+	for _, s := range cf.Configuration().Servers {
+		if string(s.ID) == c.nodeID || !util.ProbeTCP(ctx, string(s.Address), probeTimeout) {
+			continue
+		}
+		log.Printf("Shutdown: handing raft leadership over to %s", s.ID)
+		err := waitFor(ctx, func() error { return c.r.LeadershipTransferToServer(s.ID, s.Address).Error() })
+		if err == nil {
+			return
+		}
+		log.Printf("Shutdown: leadership transfer to %s: %v", s.ID, err)
+	}
+	log.Printf("Shutdown: no other server took raft leadership; the others elect one")
 }
 
 func (c *Cluster) workerNames() []string {
@@ -330,12 +458,12 @@ func (c *Cluster) workerNames() []string {
 	return names
 }
 
-// startRaft starts this server's raft node and the leader-side loops.
-func (c *Cluster) startRaft(ctx context.Context) {
+// startRaft starts this server's raft node and the leader-side loops, which
+// run until ctx ends.
+func (c *Cluster) startRaft(ctx context.Context) error {
 	nodeID := c.nodeID
 	raftAddr := c.nodesMap[nodeID].RaftAddr
 
-	// 1. Setup Raft Configuration
 	config := raft.DefaultConfig()
 	config.LocalID = raft.ServerID(nodeID)
 	config.LogOutput = io.Discard
@@ -346,34 +474,26 @@ func (c *Cluster) startRaft(ctx context.Context) {
 	config.SnapshotThreshold = 5
 	config.TrailingLogs = 50
 
-	// Fast election speeds for single node local testing
-	// config.HeartbeatTimeout = 50 * time.Millisecond
-	// config.ElectionTimeout = 50 * time.Millisecond
-	// config.LeaderLeaseTimeout = 50 * time.Millisecond
-
-	// 2. Pure In-Memory Log and Stable Storage (Replacing BoltDB)
+	// Pure in-memory log, stable and snapshot storage (deliberate: see the
+	// project notes); a restarted node rejoins and catches up.
 	memStore := raft.NewInmemStore()
-
-	// 3. Pure In-Memory Snapshot Store
 	snapshotStore := raft.NewInmemSnapshotStore()
 
-	// 4. In-Memory / Local Transport Loop
 	address, err := net.ResolveTCPAddr("tcp", raftAddr)
 	if err != nil {
-		log.Fatalf("failed to resolve tcp address: %v", err)
+		return fmt.Errorf("raft address %s: %w", raftAddr, err)
 	}
 	transport, err := raft.NewTCPTransport(raftAddr, address, 3, 10*time.Second, io.Discard)
 	if err != nil {
-		log.Fatalf("failed to build network transport: %v", err)
+		return fmt.Errorf("raft transport on %s: %w", raftAddr, err)
 	}
 
-	// 5. The state machine is the control runtime with its registered controllers
+	// The state machine is the control runtime with its registered controllers.
 	fsm := &ClusterFSM{rt: c.rt}
-
-	// 6. Instantiate Raft Node using pure in-memory parameters
 	r, err := raft.NewRaft(config, fsm, memStore, memStore, snapshotStore, transport)
 	if err != nil {
-		log.Fatalf("failed to construct raft node: %v", err)
+		_ = transport.Close()
+		return fmt.Errorf("raft: %w", err)
 	}
 	c.r = r
 
@@ -382,39 +502,46 @@ func (c *Cluster) startRaft(ctx context.Context) {
 		return true
 	})
 	r.RegisterObserver(observer)
-	go func() {
-		for obs := range eventChan {
-			// log.Printf("Raft obs:%v", obs)
+	c.observing.Go(func() { c.observe(ctx, observer, eventChan) })
+	c.wg.Go(func() { c.reconcileMembership(ctx) })
+	c.wg.Go(func() { c.forwardRaised(ctx) })
+	return nil
+}
+
+// observe follows raft's observations until ctx ends. The observer is a
+// blocking one, so raft waits for every observation to be read; after ctx ends
+// it keeps reading until the observer is deregistered, or raft would hang on
+// the next observation, shutdown included.
+func (c *Cluster) observe(ctx context.Context, observer *raft.Observer, ch <-chan raft.Observation) {
+	for {
+		select {
+		case <-ctx.Done():
+			deregistered := make(chan struct{})
+			go func() {
+				c.r.DeregisterObserver(observer)
+				close(deregistered)
+			}()
+			for {
+				select {
+				case <-ch:
+				case <-deregistered:
+					return
+				}
+			}
+		case obs := <-ch:
 			c.bsManager.NotifyBootstraped()
 			switch data := obs.Data.(type) {
 			case raft.RaftState:
 				log.Printf("RaftState:%v", data)
-				if data == raft.Leader {
+				if data == raft.Leader && ctx.Err() == nil {
 					log.Printf("Activating controllers")
-					go c.rt.Activate()
+					c.observing.Go(c.rt.Activate)
 				}
 			case raft.LeaderObservation:
 				log.Printf("Leader obs:%v", data.Leader)
-				// case raft.PeerObservation:
-				// 	log.Printf("Peer obs:%v", data)
-				// case raft.FailedHeartbeatObservation:
-				// 	log.Printf("FailedHeartbeatObservation obs:%v", data)
-				// if r.State() == raft.Leader {
-				// 	log.Printf("Removing node:%v", data.PeerID)
-				// 	r.RemoveServer(data.PeerID, 0, time.Second*3)
-				// }
-				// case raft.ResumedHeartbeatObservation:
-				// 	log.Printf("ResumedHeartbeatObservation obs:%v", data)
-				// case raft.RequestPreVoteRequest:
-				// 	log.Printf("RequestPreVoteRequest obs:%v", data)
-				// default:
-				// 	log.Printf("Obs: %+v", obs)
 			}
-
 		}
-	}()
-	go c.reconcileMembership(ctx)
-	go c.forwardRaised(ctx)
+	}
 }
 
 // forwardRaised commits the events controllers raised outside the committed

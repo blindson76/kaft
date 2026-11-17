@@ -116,3 +116,57 @@ func TestAgentKeepsWorkerIdleUntilControllerStarted(t *testing.T) {
 	goTo(rt, "a", "up")
 	waitFor(t, "worker b to probe", func() bool { return wb.probes.Load() > 0 })
 }
+
+// blockingWorker's orders run until their context ends.
+type blockingWorker struct {
+	fakeWorker
+	started chan struct{}
+}
+
+func (w *blockingWorker) Execute(ctx context.Context, _ Order) error {
+	close(w.started)
+	<-ctx.Done()
+	return ctx.Err()
+}
+
+// An order cut short by the node shutting down is not a failure: no result is
+// sent, so it stays pending and runs again after the restart. Wait returns
+// once the interrupted order has returned.
+func TestAgentShutdownLeavesInterruptedOrderPending(t *testing.T) {
+	rt := NewRuntime()
+	var failed atomic.Int64
+	submit := func(_ context.Context, ev Event) error {
+		if ev.Name == EvOrderFailed {
+			failed.Add(1)
+		}
+		rt.Apply(ev)
+		return nil
+	}
+	w := &blockingWorker{started: make(chan struct{})}
+	a := NewAgent("n1", rt, submit, w)
+	a.interval = 5 * time.Millisecond
+	ctx, cancel := context.WithCancel(context.Background())
+	a.Run(ctx)
+	waitFor(t, "agent to catch up", a.caughtUp)
+
+	rt.PlaceOrders("svc", []OrderSpec{{Node: "n1", Kind: "start"}})
+	<-w.started
+	cancel()
+
+	done := make(chan struct{})
+	go func() {
+		a.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Wait did not return after the context ended")
+	}
+	if n := failed.Load(); n != 0 {
+		t.Fatalf("interrupted order reported as failed %d time(s)", n)
+	}
+	if n := len(rt.PendingOrders("svc", "n1")); n != 1 {
+		t.Fatalf("%d pending order(s) after shutdown, want the interrupted one", n)
+	}
+}

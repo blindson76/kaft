@@ -1,6 +1,7 @@
 package kafkactl
 
 import (
+	"cmp"
 	"context"
 	"crypto/rand"
 	"encoding/hex"
@@ -19,6 +20,7 @@ import (
 	"time"
 
 	"example.com/dstate/internal/control"
+	"example.com/dstate/internal/util"
 )
 
 // Kafka entry points. The Windows .bat wrappers build a classpath that
@@ -58,6 +60,11 @@ type WorkerConfig struct {
 type Worker struct {
 	cfg WorkerConfig
 
+	// life ends with Close; the first probe runs on it and bg tracks it.
+	life   context.Context
+	cancel context.CancelFunc
+	bg     sync.WaitGroup
+
 	// ops serializes the probe and the orders.
 	ops  sync.Mutex
 	once sync.Once
@@ -76,7 +83,8 @@ func NewWorker(cfg WorkerConfig) *Worker {
 	if cfg.Heap == "" {
 		cfg.Heap = "512M"
 	}
-	return &Worker{cfg: cfg}
+	life, cancel := context.WithCancel(context.Background())
+	return &Worker{cfg: cfg, life: life, cancel: cancel}
 }
 
 func (w *Worker) Name() string { return Name }
@@ -85,11 +93,15 @@ func (w *Worker) Name() string { return Name }
 // I/O; the running flag changes when the process starts serving or exits.
 func (w *Worker) Probe(ctx context.Context) (any, error) {
 	w.once.Do(func() {
-		go func() {
+		// The first probe outlives this call, so it runs on the worker's
+		// lifetime, not on ctx.
+		w.bg.Go(func() {
 			w.ops.Lock()
 			defer w.ops.Unlock()
-			w.probe(context.Background())
-		}()
+			if w.life.Err() == nil {
+				w.probe(w.life)
+			}
+		})
 	})
 	w.mu.Lock()
 	defer w.mu.Unlock()
@@ -105,6 +117,9 @@ func (w *Worker) Probe(ctx context.Context) (any, error) {
 func (w *Worker) Execute(ctx context.Context, order control.Order) error {
 	w.ops.Lock()
 	defer w.ops.Unlock()
+	if err := cmp.Or(w.life.Err(), ctx.Err()); err != nil {
+		return err
+	}
 
 	switch order.Kind {
 	case OrderStart:
@@ -309,7 +324,10 @@ func (w *Worker) start(ctx context.Context, bootstrap bool) error {
 		log.Printf("[kafka] formatted as single-node quorum, dir=%s", dir)
 	}
 
+	// Not exec.CommandContext: the broker outlives this order. It runs until
+	// stopped, by an order or by Close.
 	cmd := exec.Command("java", w.javaArgs(w.cfg.Heap, "log4j2.yaml", classServer, w.propsPath())...)
+	util.OwnProcessGroup(cmd)
 	out, err := os.Create(filepath.Join(w.cfg.DataDir, "kafka.out"))
 	if err != nil {
 		return err
@@ -341,6 +359,9 @@ func (w *Worker) start(ctx context.Context, bootstrap bool) error {
 	deadline := time.After(2 * time.Minute)
 	for !portOpen(w.cfg.Addr) {
 		select {
+		case <-ctx.Done():
+			w.stop()
+			return ctx.Err()
 		case <-exited:
 			return errors.New("kafka exited during startup (see kafka.out)")
 		case <-deadline:
@@ -378,6 +399,42 @@ func (w *Worker) stop() {
 	_ = os.Remove(w.pidPath())
 	for i := 0; i < 100 && portOpen(w.cfg.Addr); i++ {
 		time.Sleep(200 * time.Millisecond)
+	}
+}
+
+// Close implements control.Closer: it ends the worker's goroutines, stops the
+// broker with the node and closes the metrics client.
+//
+// The broker is killed, as by every stop: Go cannot deliver a console signal
+// to it on Windows for a controlled shutdown. Its partitions move to the other
+// brokers once its session expires, and its data is reformatted at the next
+// probe anyway.
+func (w *Worker) Close(ctx context.Context) error {
+	w.cancel()
+	w.bg.Wait()
+	w.ops.Lock()
+	defer w.ops.Unlock()
+
+	w.metrics.mu.Lock()
+	w.metrics.close()
+	w.metrics.mu.Unlock()
+
+	w.mu.Lock()
+	running := w.proc != nil
+	w.mu.Unlock()
+	if running {
+		log.Printf("[kafka] stopping the broker")
+	}
+	done := make(chan struct{})
+	go func() {
+		w.stop()
+		close(done)
+	}()
+	select {
+	case <-done:
+		return nil
+	case <-ctx.Done():
+		return fmt.Errorf("kafka stop: %w", ctx.Err())
 	}
 }
 

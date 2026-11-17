@@ -131,6 +131,10 @@ func (m *machine[D]) Activate() {
 	a.Activate()
 }
 
+func (m *machine[D]) Stop(ctx context.Context) error {
+	return m.current().StopCtx(ctx)
+}
+
 func (m *machine[D]) Snapshot() (json.RawMessage, error) {
 	return json.Marshal(m.current().Snapshot())
 }
