@@ -7,6 +7,10 @@ mongo:
   user: admin
   password: "123"
   args: ["--wiredTigerCacheSizeGB", "0.25"]
+  # Forming the replica set waits this long for mongo nodes that join late,
+  # so the most up-to-date data is not missed. Starts once `members` nodes
+  # have reported; ends early once every mongo node has.
+  decision_window: 30s
 kafka:
   # Kafka 3.9+ (dynamic KRaft quorum). Run through java directly, not the .bat files.
   home: C:\Users\ubozkurt\Downloads\kafka_2.13-4.1.0

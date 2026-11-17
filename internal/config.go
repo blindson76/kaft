@@ -115,6 +115,11 @@ type MongoConfig struct {
 	Password string `yaml:"password"`
 	// Args are extra mongod command line arguments.
 	Args []string `yaml:"args"`
+	// DecisionWindow is how long forming the replica set waits for
+	// candidates that join late (e.g. "30s"). It starts once `members` nodes
+	// have reported and ends early once every mongo node has. Zero: decide as
+	// soon as the nodes that are up have.
+	DecisionWindow time.Duration `yaml:"decision_window"`
 	// DependsOn lists controllers that must be in given states before the
 	// replica set is formed.
 	DependsOn []control.Requirement `yaml:"depends_on"`

@@ -4,6 +4,7 @@ import (
 	"cmp"
 	"maps"
 	"slices"
+	"time"
 )
 
 // Plan modes: how the replica set config is brought to Plan.Members once the
@@ -58,6 +59,12 @@ type Data struct {
 	// DepsReady is true while the controllers this one depends on are in the
 	// states it requires. It gates forming the cluster, nothing else.
 	DepsReady bool `json:"deps_ready"`
+	// Round counts the decision windows opened. WindowClosed is set once the
+	// current one has passed; Forced once the decision is not to wait for
+	// any further report either.
+	Round        uint64 `json:"round"`
+	WindowClosed bool   `json:"window_closed"`
+	Forced       bool   `json:"forced,omitempty"`
 }
 
 func (d Data) Clone() Data {
@@ -76,8 +83,14 @@ func (d Data) Clone() Data {
 type Topology struct {
 	// Size is how many members the replica set should have.
 	Size int
-	// Addrs maps node ID to its mongod host:port.
+	// Addrs maps node ID to its mongod host:port. These are the candidates.
 	Addrs map[string]string
+	// Window is how long forming a replica set waits for candidates that join
+	// late, so the decision is made with as many reports as possible. It
+	// starts once Size candidates have reported and is cut short once every
+	// candidate has. Zero: decide as soon as every node that is up has
+	// reported.
+	Window time.Duration
 }
 
 func (t Topology) nodeOf(host string) string {
@@ -111,6 +124,12 @@ func (d Data) allReported() bool {
 		}
 	}
 	return true
+}
+
+// allCandidatesReported reports whether every candidate is up and has
+// reported: nobody is left to wait for.
+func (d Data) allCandidatesReported(t Topology) bool {
+	return len(d.reported()) >= len(t.Addrs)
 }
 
 // needsWipe decides, from oplog positions alone, whether a node can join the

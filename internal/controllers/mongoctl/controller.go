@@ -19,6 +19,9 @@ type (
 // Step timeouts. They run on the leader only and restart on a leader change,
 // so they are lower bounds.
 const (
+	// collectTimeout counts from the end of the decision window: nodes that
+	// are up but have not reported get this long before the decision is made
+	// without them.
 	collectTimeout   = 20 * time.Second
 	prepareTimeout   = 3 * time.Minute
 	startTimeout     = 3 * time.Minute
@@ -47,16 +50,35 @@ func await(d Data, orders []control.OrderSpec) Data {
 	return d
 }
 
+// roundOf reads the "round" parameter of a timer event, which may have gone
+// through JSON.
+func roundOf(e evt) uint64 {
+	switch v := e.Params["round"].(type) {
+	case uint64:
+		return v
+	case float64:
+		return uint64(v)
+	case int:
+		return uint64(v)
+	}
+	return 0
+}
+
 func stepDone(d Data) bool   { return len(d.Await) == 0 && !d.Failed }
 func stepFailed(d Data) bool { return len(d.Await) == 0 && d.Failed }
 
 // NewController builds the mongo controller.
 //
-//		collecting ─▶ preparing ─▶ starting ─▶ (electing ─▶) configuring ─▶ monitoring
-//		     ▲            │            │            │              │            │
-//		     └─ resetting ◀────────────┴────────────┴──────────────┴────────────┘
+//		collecting ⇄ deciding ─▶ preparing ─▶ starting ─▶ (electing ─▶) configuring ─▶ monitoring
+//		     ▲                       │            │            │              │            │
+//		     └──────── resetting ◀───┴────────────┴────────────┴──────────────┴────────────┘
 //
-//	  - collecting: wait for the probe reports, then decide (formPlan).
+//	  - collecting: wait until enough nodes for a replica set (Topology.Size)
+//	    have reported.
+//	  - deciding: the decision window (Topology.Window) runs, so candidates
+//	    that join late are not left out; then decide (formPlan). It ends early
+//	    once every candidate has reported. Back to collecting, and a new
+//	    window later, if too few reports are left.
 //	  - preparing: wipe the nodes the plan says cannot join as they are.
 //	  - starting: start mongod on the nodes of the plan.
 //	  - electing: wait for the existing replica set to elect a primary.
@@ -205,17 +227,68 @@ func NewController(t Topology, requires ...control.Requirement) control.Controll
 		Initial("collecting").
 		State("collecting", func(sb *builder) {
 			track(sb)
-			// Decide as soon as every alive node has reported...
+			// The decision window opens once a replica set could be formed.
+			sb.Always().Guard(func(d Data) bool { return len(d.reported()) >= t.Size }).
+				Assign(func(d Data) Data {
+					d.Round++
+					d.WindowClosed, d.Forced = false, false
+					if t.Window > 0 {
+						log.Printf("[mongo] %d of %d candidates reported; decision window of %s opened", len(d.reported()), len(t.Addrs), t.Window)
+					}
+					return d
+				}).
+				GoTo("deciding")
+		}).
+		State("deciding", func(sb *builder) {
+			track(sb)
+			sb.Always().Guard(func(d Data) bool { return len(d.reported()) < t.Size }).
+				Assign(func(d Data) Data {
+					log.Printf("[mongo] fewer than %d candidates left; decision window cancelled", t.Size)
+					return d
+				}).
+				GoTo("collecting")
+			// Decide as soon as every candidate has reported: there is
+			// nobody left to wait for...
 			adoptPlan(sb.Always(), func(d Data) (Plan, bool) {
-				if !d.allReported() {
+				if !d.allCandidatesReported(t) {
 					return Plan{}, false
 				}
 				return form(d)
 			})
-			// ...or, after a while, with the ones that did.
-			sb.After(collectTimeout).Raise("collect.timeout")
-			adoptPlan(sb.On("collect.timeout"), form)
-			sb.On("collect.timeout").GoTo("collecting")
+			// ...or once the decision window has passed and every node that
+			// is up has reported...
+			adoptPlan(sb.Always(), func(d Data) (Plan, bool) {
+				if !(d.WindowClosed || t.Window <= 0) || !d.allReported() {
+					return Plan{}, false
+				}
+				return form(d)
+			})
+			// ...or, a while after the window, with the ones that did.
+			adoptPlan(sb.Always(), func(d Data) (Plan, bool) {
+				if !d.Forced {
+					return Plan{}, false
+				}
+				return form(d)
+			})
+			// The timer events carry the window they belong to, so one
+			// committed late cannot close a window opened after it.
+			round := func(d Data) gstate.Params { return gstate.Params{"round": d.Round} }
+			current := func(d Data, e evt) bool { return roundOf(e) == d.Round }
+			if t.Window > 0 {
+				sb.After(t.Window).RaiseWith("collect.window", round)
+			}
+			sb.On("collect.window").GuardEvent(func(d Data, e evt) bool { return current(d, e) && !d.WindowClosed }).
+				Assign(func(d Data) Data {
+					log.Printf("[mongo] decision window closed: %d of %d candidates reported", len(d.reported()), len(t.Addrs))
+					d.WindowClosed = true
+					return d
+				})
+			sb.After(t.Window+collectTimeout).RaiseWith("collect.timeout", round)
+			sb.On("collect.timeout").GuardEvent(current).
+				Assign(func(d Data) Data {
+					d.WindowClosed, d.Forced = true, true
+					return d
+				})
 		}).
 		State("preparing", func(sb *builder) {
 			track(sb)

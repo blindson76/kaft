@@ -68,7 +68,7 @@ func registerMongo(cluster *internal.Cluster, nodeID string, cfg *internal.Clust
 	}
 
 	workers := cfg.WorkersOf(internal.ControllerMongo)
-	topology := mongoctl.Topology{Size: m.Members, Addrs: map[string]string{}}
+	topology := mongoctl.Topology{Size: m.Members, Addrs: map[string]string{}, Window: m.DecisionWindow}
 	for _, n := range workers {
 		topology.Addrs[n.ID] = n.MongoAddr
 	}
