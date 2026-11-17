@@ -3,13 +3,12 @@ package main
 import (
 	"context"
 	"flag"
-	"log"
-	"net"
 	"os"
 	"path/filepath"
 	"strings"
 
 	"example.com/dstate/internal"
+	"example.com/dstate/internal/control"
 	"example.com/dstate/internal/controllers/kafkactl"
 	"example.com/dstate/internal/controllers/mongoctl"
 	"example.com/dstate/internal/controllers/timectl"
@@ -28,9 +27,9 @@ func main() {
 	// log.Printf("Config:%+v\n", cfg)
 
 	cluster := internal.NewCluster(nodeID, cfg)
-	// Each service is one controller (replicated decisions) plus one worker
-	// (node-local actions). Add new services here. internal/controllers/demo
-	// is a minimal template.
+	// Each service is one controller (replicated decisions, on the servers)
+	// plus one worker (node-local actions, on the workers listing it). Add
+	// new services here. internal/controllers/demo is a minimal template.
 	if cfg.Mongo.Bin != "" {
 		registerMongo(cluster, nodeID, cfg)
 	}
@@ -42,6 +41,15 @@ func main() {
 	}
 	cluster.Start(context.Background())
 	select {}
+}
+
+// ids returns the IDs of nodes.
+func ids(nodes []internal.NodeConfig) []string {
+	out := make([]string, 0, len(nodes))
+	for _, n := range nodes {
+		out = append(out, n.ID)
+	}
+	return out
 }
 
 func registerMongo(cluster *internal.Cluster, nodeID string, cfg *internal.ClusterConfig) {
@@ -59,27 +67,26 @@ func registerMongo(cluster *internal.Cluster, nodeID string, cfg *internal.Clust
 		m.User, m.Password = "admin", "123"
 	}
 
+	workers := cfg.WorkersOf(internal.ControllerMongo)
 	topology := mongoctl.Topology{Size: m.Members, Addrs: map[string]string{}}
-	for _, n := range cfg.Nodes {
-		if n.MongoAddr != "" {
-			topology.Addrs[n.ID] = n.MongoAddr
-		}
-	}
-	addr, ok := topology.Addrs[nodeID]
-	if !ok {
-		log.Fatalf("node %s has no mongo_addr in the config", nodeID)
+	for _, n := range workers {
+		topology.Addrs[n.ID] = n.MongoAddr
 	}
 
-	cluster.Register(mongoctl.NewController(topology, m.DependsOn...), mongoctl.NewWorker(mongoctl.WorkerConfig{
-		Node:     nodeID,
-		Addr:     addr,
-		Bin:      m.Bin,
-		DataDir:  filepath.Join(m.DataDir, nodeID),
-		ReplSet:  m.ReplSet,
-		User:     m.User,
-		Password: m.Password,
-		Args:     m.Args,
-	}))
+	var worker control.Worker
+	if cluster.RunsWorker(internal.ControllerMongo) {
+		worker = mongoctl.NewWorker(mongoctl.WorkerConfig{
+			Node:     nodeID,
+			Addr:     topology.Addrs[nodeID],
+			Bin:      m.Bin,
+			DataDir:  filepath.Join(m.DataDir, nodeID),
+			ReplSet:  m.ReplSet,
+			User:     m.User,
+			Password: m.Password,
+			Args:     m.Args,
+		})
+	}
+	cluster.Register(mongoctl.NewController(topology, m.DependsOn...), ids(workers), worker)
 }
 
 // defaultKafkaClusterID is used when the config gives none. Any fixed value
@@ -98,36 +105,32 @@ func registerKafka(cluster *internal.Cluster, nodeID string, cfg *internal.Clust
 		k.Members = cfg.ExpectedBootstrap
 	}
 
+	workers := cfg.WorkersOf(internal.ControllerKafka)
 	topology := kafkactl.Topology{Size: k.Members, IDs: map[string]int{}, Controllers: map[string]string{}}
-	var self internal.NodeConfig
 	var bootstrap []string
-	for _, n := range cfg.Nodes {
-		if n.KafkaAddr == "" || n.KafkaControllerAddr == "" {
-			continue
-		}
+	for _, n := range workers {
 		topology.IDs[n.ID] = n.KafkaID
 		topology.Controllers[n.ID] = n.KafkaControllerAddr
 		bootstrap = append(bootstrap, n.KafkaControllerAddr)
-		if n.ID == nodeID {
-			self = n
-		}
-	}
-	if self.ID == "" {
-		log.Fatalf("node %s has no kafka_addr / kafka_controller_addr in the config", nodeID)
 	}
 
-	cluster.Register(kafkactl.NewController(topology, k.DependsOn...), kafkactl.NewWorker(kafkactl.WorkerConfig{
-		Node:           nodeID,
-		ID:             self.KafkaID,
-		Addr:           self.KafkaAddr,
-		ControllerAddr: self.KafkaControllerAddr,
-		Bootstrap:      bootstrap,
-		Home:           k.Home,
-		DataDir:        filepath.Join(k.DataDir, nodeID),
-		ClusterID:      k.ClusterID,
-		Replication:    min(k.Members, 3),
-		Heap:           k.Heap,
-	}))
+	var worker control.Worker
+	if cluster.RunsWorker(internal.ControllerKafka) {
+		self, _ := cfg.Node(nodeID)
+		worker = kafkactl.NewWorker(kafkactl.WorkerConfig{
+			Node:           nodeID,
+			ID:             self.KafkaID,
+			Addr:           self.KafkaAddr,
+			ControllerAddr: self.KafkaControllerAddr,
+			Bootstrap:      bootstrap,
+			Home:           k.Home,
+			DataDir:        filepath.Join(k.DataDir, nodeID),
+			ClusterID:      k.ClusterID,
+			Replication:    min(k.Members, 3),
+			Heap:           k.Heap,
+		})
+	}
+	cluster.Register(kafkactl.NewController(topology, k.DependsOn...), ids(workers), worker)
 }
 
 func registerTime(cluster *internal.Cluster, nodeID string, cfg *internal.ClusterConfig) {
@@ -139,28 +142,33 @@ func registerTime(cluster *internal.Cluster, nodeID string, cfg *internal.Cluste
 		t.Service = "NTP"
 	}
 
+	workers := cfg.WorkersOf(internal.ControllerTime)
 	topology := timectl.Topology{Addrs: map[string]string{}, External: t.External}
-	for _, n := range cfg.Nodes {
+	for _, n := range workers {
 		addr := n.NTPAddr
 		if addr == "" {
-			addr, _, _ = net.SplitHostPort(n.RaftAddr)
+			addr = n.Host()
 		}
 		topology.Addrs[n.ID] = addr
 	}
 
-	var system timectl.System = timectl.Meinberg{Conf: t.NTPConf, Service: t.Service}
-	if t.DryRun {
-		system = &timectl.DryRun{}
+	var worker control.Worker
+	if cluster.RunsWorker(internal.ControllerTime) {
+		var system timectl.System = timectl.Meinberg{Conf: t.NTPConf, Service: t.Service}
+		if t.DryRun {
+			system = &timectl.DryRun{}
+		}
+		worker = timectl.NewWorker(timectl.WorkerConfig{
+			Node:          nodeID,
+			StateFile:     strings.ReplaceAll(t.StateFile, "{node}", nodeID),
+			External:      t.External,
+			Interval:      t.CheckInterval,
+			JumpThreshold: t.JumpThreshold,
+			JumpWindow:    t.JumpWindow,
+			System:        system,
+		})
 	}
-	cluster.Register(timectl.NewController(topology, t.DependsOn...), timectl.NewWorker(timectl.WorkerConfig{
-		Node:          nodeID,
-		StateFile:     strings.ReplaceAll(t.StateFile, "{node}", nodeID),
-		External:      t.External,
-		Interval:      t.CheckInterval,
-		JumpThreshold: t.JumpThreshold,
-		JumpWindow:    t.JumpWindow,
-		System:        system,
-	}))
+	cluster.Register(timectl.NewController(topology, t.DependsOn...), ids(workers), worker)
 	for pattern, handler := range timectl.Routes(cluster.Submit) {
 		cluster.Handle(pattern, handler)
 	}

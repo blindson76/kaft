@@ -9,6 +9,7 @@ import (
 	"net"
 	"net/http"
 	"slices"
+	"strings"
 	"time"
 
 	"example.com/dstate/internal/control"
@@ -70,40 +71,68 @@ func (s *ClusterSnapshot) Persist(sink raft.SnapshotSink) error {
 func (s *ClusterSnapshot) Release() {}
 
 type Cluster struct {
-	nodesMap  map[string]NodeConfig
-	nodeID    string
+	nodesMap map[string]NodeConfig
+	nodeID   string
+	self     NodeConfig
+	// nodes are all node IDs, servers the server ones; both sorted.
 	nodes     []string
+	servers   []string
 	expected  int
 	bsManager *ClusterBootstrapController
-	r         *raft.Raft
-	rt        *control.Runtime
-	workers   []control.Worker
-	routes    map[string]http.HandlerFunc
+	// r is nil on a worker-only node.
+	r       *raft.Raft
+	rt      *control.Runtime
+	workers []control.Worker
+	routes  map[string]http.HandlerFunc
+	// leader reaches the raft leader from a worker-only node.
+	leader *leaderClient
 }
 
 func NewCluster(self string, cfg *ClusterConfig) *Cluster {
+	nodeCfg, ok := cfg.Node(self)
+	if !ok {
+		log.Fatalf("node %s is not in the config", self)
+	}
 	nodes := make([]string, 0)
+	servers := make([]string, 0)
 	nodesMap := map[string]NodeConfig{}
 	for _, node := range cfg.Nodes {
 		nodes = append(nodes, node.ID)
+		if node.IsServer() {
+			servers = append(servers, node.ID)
+		}
 		nodesMap[node.ID] = node
 	}
 	slices.Sort(nodes)
+	slices.Sort(servers)
 	c := &Cluster{
 		nodeID:   self,
+		self:     nodeCfg,
 		nodesMap: nodesMap,
 		nodes:    nodes,
+		servers:  servers,
 		expected: cfg.ExpectedBootstrap,
 		rt:       control.NewRuntime(),
 	}
-	delayBootstrap := time.Second*3 + time.Duration(slices.Index(nodes, c.nodeID)*int(time.Second))
-	c.bsManager = NewClusterManager(nodes, cfg.ExpectedBootstrap, delayBootstrap, c)
+	if nodeCfg.IsServer() {
+		delayBootstrap := time.Second*3 + time.Duration(slices.Index(servers, c.nodeID)*int(time.Second))
+		c.bsManager = NewClusterManager(servers, cfg.ExpectedBootstrap, delayBootstrap, c)
+	} else {
+		addrs := make([]string, 0, len(servers))
+		for _, id := range servers {
+			addrs = append(addrs, nodesMap[id].HTTPAddr)
+		}
+		c.leader = &leaderClient{addrs: addrs}
+	}
 	return c
 }
 
-// Register adds a controller and its node-local worker. Every node must
-// register the same controllers, before Start. worker may be nil for a
-// controller that needs no local agent.
+// IsServer reports whether this node runs raft and the controllers.
+func (c *Cluster) IsServer() bool { return c.self.IsServer() }
+
+// RunsWorker reports whether this node runs the worker of controller.
+func (c *Cluster) RunsWorker(controller string) bool { return c.self.RunsWorker(controller) }
+
 // Handle adds a route to the node's HTTP endpoint, for a controller's operator
 // API. pattern is a net/http pattern such as "POST /time". Call before Start.
 func (c *Cluster) Handle(pattern string, handler http.HandlerFunc) {
@@ -113,8 +142,17 @@ func (c *Cluster) Handle(pattern string, handler http.HandlerFunc) {
 	c.routes[pattern] = handler
 }
 
-func (c *Cluster) Register(controller control.Controller, worker control.Worker) {
-	c.rt.Register(controller)
+// Register adds a controller and this node's worker for it, before Start.
+//
+// The controller is kept only on a server; every server must register the
+// same controllers with the same nodes. nodes are the nodes that run the
+// controller's worker: the controller only hears about their liveness.
+//
+// worker is the local worker, or nil when this node does not run one.
+func (c *Cluster) Register(controller control.Controller, nodes []string, worker control.Worker) {
+	if c.IsServer() {
+		c.rt.Register(controller, nodes...)
+	}
 	if worker != nil {
 		c.workers = append(c.workers, worker)
 	}
@@ -146,16 +184,17 @@ const (
 	applyTimeout      = 2 * time.Second
 )
 
-// reconcileMembership runs on every node but only acts while this node is the
-// raft leader. Each tick it compares the raft configuration with what is
-// actually reachable: configured nodes that are up but not members are added
+// reconcileMembership runs on every server but only acts while this node is
+// the raft leader. Each tick it compares the raft configuration with what is
+// actually reachable: configured servers that are up but not members are added
 // as voters, and members unreachable for deadNodeTimeout are removed so the
 // quorum shrinks with the cluster. Membership never shrinks below `expected`.
 // At most one change is made per tick, since raft applies configuration
-// changes one at a time.
+// changes one at a time. Worker-only nodes are never raft members.
 //
-// The same probes feed the control layer: a liveness change is committed as a
-// node.up / node.down event.
+// The same probes feed the control layer: a liveness change of any node,
+// server or worker, is committed as a node.up / node.down event. Servers are
+// probed on their raft address, worker-only nodes on their HTTP address.
 func (c *Cluster) reconcileMembership(ctx context.Context) {
 	ticker := time.NewTicker(reconcileInterval)
 	defer ticker.Stop()
@@ -190,12 +229,17 @@ func (c *Cluster) reconcileMembership(ctx context.Context) {
 				continue
 			}
 			id := raft.ServerID(node)
-			addr := c.nodesMap[node].RaftAddr
+			cfg := c.nodesMap[node]
+			server := cfg.IsServer()
+			addr, probeAddr := cfg.RaftAddr, cfg.RaftAddr
+			if !server {
+				probeAddr = cfg.HTTPAddr
+			}
 
-			if util.ProbeTCP(ctx, addr, probeTimeout) {
+			if util.ProbeTCP(ctx, probeAddr, probeTimeout) {
 				delete(downSince, id)
 				c.syncLiveness(node, true)
-				if members[id] || changed {
+				if !server || members[id] || changed {
 					continue
 				}
 				log.Println("Adding node", node)
@@ -215,7 +259,7 @@ func (c *Cluster) reconcileMembership(ctx context.Context) {
 				continue
 			}
 			c.syncLiveness(node, false)
-			if !members[id] || changed || len(servers) <= c.expected {
+			if !server || !members[id] || changed || len(servers) <= c.expected {
 				continue
 			}
 			log.Printf("Removing lost node %s (unreachable for %v)", node, time.Since(since).Round(time.Second))
@@ -249,7 +293,45 @@ func (c *Cluster) WaitNode(ctx context.Context, node string) {
 	log.Println("Node ready", node)
 }
 
+// Start runs the node in its roles: raft and the controllers on a server, the
+// agent with its workers on a worker. On a server it returns once the cluster
+// is bootstrapped (or found to be already); everything keeps running in the
+// background until ctx ends.
 func (c *Cluster) Start(ctx context.Context) {
+	log.Printf("Node %s roles: %s; workers: %s", c.nodeID, strings.Join(c.self.Roles, ", "), strings.Join(c.workerNames(), ", "))
+	var view control.View = c.rt
+	if c.IsServer() {
+		if err := c.rt.Validate(); err != nil {
+			log.Fatalf("invalid controller setup: %v", err)
+		}
+		c.startRaft(ctx)
+	} else {
+		rv := control.NewRemoteView(c.nodeID, c.fetchAgentState)
+		rv.Run(ctx)
+		view = rv
+	}
+	go c.serveHTTP(ctx)
+	if len(c.workers) > 0 {
+		control.NewAgent(c.nodeID, view, c.Submit, c.workers...).Run(ctx)
+	}
+	if c.IsServer() {
+		_ = c.bsManager.Start(ctx)
+	}
+}
+
+func (c *Cluster) workerNames() []string {
+	names := make([]string, 0, len(c.workers))
+	for _, w := range c.workers {
+		names = append(names, w.Name())
+	}
+	if len(names) == 0 {
+		return []string{"none"}
+	}
+	return names
+}
+
+// startRaft starts this server's raft node and the leader-side loops.
+func (c *Cluster) startRaft(ctx context.Context) {
 	nodeID := c.nodeID
 	raftAddr := c.nodesMap[nodeID].RaftAddr
 
@@ -333,13 +415,6 @@ func (c *Cluster) Start(ctx context.Context) {
 	}()
 	go c.reconcileMembership(ctx)
 	go c.forwardRaised(ctx)
-	if err := c.rt.Validate(); err != nil {
-		log.Fatalf("invalid controller setup: %v", err)
-	}
-	go c.serveHTTP(ctx)
-	control.NewAgent(nodeID, c.rt, c.Submit, c.workers...).Run(ctx)
-	c.bsManager.Start(ctx)
-
 }
 
 // forwardRaised commits the events controllers raised outside the committed
@@ -376,6 +451,11 @@ func (c *Cluster) apply(ev control.Event) error {
 // Submit commits ev from any node: directly when this node is the leader,
 // otherwise by handing it to the leader over HTTP.
 func (c *Cluster) Submit(ctx context.Context, ev control.Event) error {
+	if c.r == nil {
+		return c.leader.call(ctx, func(ctx context.Context, addr string) error {
+			return postEvent(ctx, addr, ev)
+		})
+	}
 	if c.r.State() == raft.Leader {
 		return c.apply(ev)
 	}

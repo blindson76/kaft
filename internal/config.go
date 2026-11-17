@@ -1,8 +1,12 @@
 package internal
 
 import (
+	"errors"
 	"fmt"
+	"net"
 	"os"
+	"slices"
+	"strings"
 	"time"
 
 	"example.com/dstate/internal/control"
@@ -10,9 +14,29 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
+// Node roles.
+const (
+	// RoleServer runs raft and the controllers: it holds a replica of the
+	// cluster state and takes part in the quorum.
+	RoleServer = "server"
+	// RoleWorker runs the workers of the controllers listed in the node's
+	// Controllers: it carries out the orders for its local services.
+	RoleWorker = "worker"
+)
+
 type NodeConfig struct {
-	ID       string `yaml:"id"`
+	ID string `yaml:"id"`
+	// Roles is what the node runs: "server", "worker" or both. Defaults to
+	// both.
+	Roles []string `yaml:"roles"`
+	// Controllers lists the controllers whose worker runs on this node, by
+	// name (mongo, kafka, time). Only meaningful for a worker. Defaults to
+	// every controller enabled in the config.
+	Controllers []string `yaml:"controllers"`
+	// RaftAddr is required for a server.
 	RaftAddr string `yaml:"raft_addr"`
+	// HTTPAddr is required for every node: servers take events there, and
+	// the leader checks the liveness of worker-only nodes against it.
 	HTTPAddr string `yaml:"http_addr"`
 	// MongoAddr is the host:port the node's mongod serves replica set
 	// traffic on; it is also the member host in the replica set config.
@@ -23,7 +47,7 @@ type NodeConfig struct {
 	KafkaAddr           string `yaml:"kafka_addr"`
 	KafkaControllerAddr string `yaml:"kafka_controller_addr"`
 	// NTPAddr is the address the node's ntpd is reached at by the other
-	// nodes. Defaults to the host of RaftAddr.
+	// nodes. Defaults to the host of RaftAddr, or of HTTPAddr.
 	NTPAddr string `yaml:"ntp_addr"`
 }
 
@@ -104,6 +128,151 @@ type ClusterConfig struct {
 	Time              TimeConfig   `yaml:"time"`
 }
 
+// Controller names, as used in NodeConfig.Controllers. They match the names
+// the controllers register under.
+const (
+	ControllerMongo = "mongo"
+	ControllerKafka = "kafka"
+	ControllerTime  = "time"
+)
+
+// IsServer reports whether the node runs raft and the controllers.
+func (n NodeConfig) IsServer() bool { return slices.Contains(n.Roles, RoleServer) }
+
+// IsWorker reports whether the node runs workers.
+func (n NodeConfig) IsWorker() bool { return slices.Contains(n.Roles, RoleWorker) }
+
+// RunsWorker reports whether the node runs the worker of controller.
+func (n NodeConfig) RunsWorker(controller string) bool {
+	return n.IsWorker() && slices.Contains(n.Controllers, controller)
+}
+
+// Host returns the host the node is reached at, from RaftAddr or HTTPAddr.
+func (n NodeConfig) Host() string {
+	for _, addr := range []string{n.RaftAddr, n.HTTPAddr} {
+		if host, _, err := net.SplitHostPort(addr); err == nil && host != "" {
+			return host
+		}
+	}
+	return ""
+}
+
+// Enabled returns the controllers this config turns on, in a fixed order.
+func (c *ClusterConfig) Enabled() []string {
+	var out []string
+	if c.Mongo.Bin != "" {
+		out = append(out, ControllerMongo)
+	}
+	if c.Kafka.Home != "" {
+		out = append(out, ControllerKafka)
+	}
+	if c.Time.StateFile != "" {
+		out = append(out, ControllerTime)
+	}
+	return out
+}
+
+// Node returns the config of node id.
+func (c *ClusterConfig) Node(id string) (NodeConfig, bool) {
+	for _, n := range c.Nodes {
+		if n.ID == id {
+			return n, true
+		}
+	}
+	return NodeConfig{}, false
+}
+
+// Servers returns the server nodes, in config order.
+func (c *ClusterConfig) Servers() []NodeConfig {
+	var out []NodeConfig
+	for _, n := range c.Nodes {
+		if n.IsServer() {
+			out = append(out, n)
+		}
+	}
+	return out
+}
+
+// WorkersOf returns the nodes that run the worker of controller, in config
+// order.
+func (c *ClusterConfig) WorkersOf(controller string) []NodeConfig {
+	var out []NodeConfig
+	for _, n := range c.Nodes {
+		if n.RunsWorker(controller) {
+			out = append(out, n)
+		}
+	}
+	return out
+}
+
+// normalize fills in the defaults: a node without roles is both a server and
+// a worker, and a worker without controllers runs every enabled one.
+func (c *ClusterConfig) normalize() {
+	enabled := c.Enabled()
+	for i := range c.Nodes {
+		n := &c.Nodes[i]
+		if len(n.Roles) == 0 {
+			n.Roles = []string{RoleServer, RoleWorker}
+		}
+		for j, r := range n.Roles {
+			n.Roles[j] = strings.ToLower(strings.TrimSpace(r))
+		}
+		if n.IsWorker() && n.Controllers == nil {
+			n.Controllers = slices.Clone(enabled)
+		}
+	}
+}
+
+// Validate checks the node roles and controller assignments.
+func (c *ClusterConfig) Validate() error {
+	var errs []error
+	enabled := c.Enabled()
+	seen := map[string]bool{}
+	for _, n := range c.Nodes {
+		if n.ID == "" {
+			errs = append(errs, errors.New("a node has no id"))
+			continue
+		}
+		if seen[n.ID] {
+			errs = append(errs, fmt.Errorf("node %s: duplicate id", n.ID))
+		}
+		seen[n.ID] = true
+		for _, r := range n.Roles {
+			if r != RoleServer && r != RoleWorker {
+				errs = append(errs, fmt.Errorf("node %s: unknown role %q (want %s or %s)", n.ID, r, RoleServer, RoleWorker))
+			}
+		}
+		if n.HTTPAddr == "" {
+			errs = append(errs, fmt.Errorf("node %s: http_addr is required", n.ID))
+		}
+		if n.IsServer() && n.RaftAddr == "" {
+			errs = append(errs, fmt.Errorf("node %s: a server needs raft_addr", n.ID))
+		}
+		if !n.IsWorker() && len(n.Controllers) > 0 {
+			errs = append(errs, fmt.Errorf("node %s: controllers are given but the node is not a worker", n.ID))
+		}
+		for _, name := range n.Controllers {
+			if !slices.Contains(enabled, name) {
+				errs = append(errs, fmt.Errorf("node %s: controller %q is unknown or not enabled (enabled: %s)", n.ID, name, strings.Join(enabled, ", ")))
+			}
+		}
+		if n.RunsWorker(ControllerMongo) && n.MongoAddr == "" {
+			errs = append(errs, fmt.Errorf("node %s: the mongo worker needs mongo_addr", n.ID))
+		}
+		if n.RunsWorker(ControllerKafka) && (n.KafkaAddr == "" || n.KafkaControllerAddr == "") {
+			errs = append(errs, fmt.Errorf("node %s: the kafka worker needs kafka_addr and kafka_controller_addr", n.ID))
+		}
+	}
+	servers := len(c.Servers())
+	if servers == 0 {
+		errs = append(errs, errors.New("no server node"))
+	}
+	if c.ExpectedBootstrap > servers {
+		errs = append(errs, fmt.Errorf("expected_bootstrap is %d but there are only %d servers", c.ExpectedBootstrap, servers))
+	}
+	return errors.Join(errs...)
+}
+
 func ParseConfig(filePath string) (*ClusterConfig, error) {
 	data, err := os.ReadFile(filePath)
 	if err != nil {
@@ -119,6 +288,9 @@ func ParseConfigBytes(data []byte) (*ClusterConfig, error) {
 	if err := yaml.Unmarshal(data, &cfg); err != nil {
 		return nil, fmt.Errorf("yaml parse error: %w", err)
 	}
-
+	cfg.normalize()
+	if err := cfg.Validate(); err != nil {
+		return nil, fmt.Errorf("invalid config: %w", err)
+	}
 	return &cfg, nil
 }

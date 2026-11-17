@@ -14,6 +14,20 @@ import (
 // SubmitFunc sends an event towards the raft log, from any node.
 type SubmitFunc func(ctx context.Context, ev Event) error
 
+// View is the replicated state an agent works from. On a server node it is
+// the local Runtime; on a worker-only node, a RemoteView of a server's.
+type View interface {
+	// Boot returns the boot ID last announced by node's agent, or "".
+	Boot(node string) string
+	// Started reports whether the controller has been started.
+	Started(controller string) bool
+	// Report returns the last replicated report of controller for node.
+	Report(controller, node string) json.RawMessage
+	// PendingOrders returns the pending orders of controller for node,
+	// oldest first.
+	PendingOrders(controller, node string) []Order
+}
+
 // Agent is the node-local side of the control layer. For each worker it keeps
 // two things converging, by comparing against the local replica instead of
 // reacting to messages:
@@ -34,13 +48,13 @@ type SubmitFunc func(ctx context.Context, ev Event) error
 type Agent struct {
 	node     string
 	boot     string
-	rt       *Runtime
+	rt       View
 	submit   SubmitFunc
 	workers  []Worker
 	interval time.Duration
 }
 
-func NewAgent(node string, rt *Runtime, submit SubmitFunc, workers ...Worker) *Agent {
+func NewAgent(node string, rt View, submit SubmitFunc, workers ...Worker) *Agent {
 	id := make([]byte, 8)
 	_, _ = rand.Read(id)
 	return &Agent{

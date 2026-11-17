@@ -82,7 +82,8 @@ func (c *Cluster) serveWS(w http.ResponseWriter, r *http.Request) {
 	}
 
 	hello := wsHello{Type: "hello", Node: c.nodeID, Controllers: c.rt.Diagrams()}
-	for _, id := range c.nodes {
+	// Only servers serve this view.
+	for _, id := range c.servers {
 		hello.Nodes = append(hello.Nodes, wsNode{ID: id, HTTP: c.nodesMap[id].HTTPAddr})
 	}
 	if _, err := send(hello); err != nil {

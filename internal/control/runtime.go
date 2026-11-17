@@ -57,7 +57,10 @@ type Runtime struct {
 
 	controllers []Controller
 	byName      map[string]Controller
-	outbox      chan Event
+	// scope holds, per controller, the nodes that run its worker. A
+	// controller without an entry concerns every node.
+	scope  map[string]map[string]bool
+	outbox chan Event
 
 	// subs are the listeners told whenever the replicated state changed.
 	subMu sync.Mutex
@@ -68,20 +71,49 @@ func NewRuntime() *Runtime {
 	return &Runtime{
 		store:  newStore(),
 		byName: map[string]Controller{},
+		scope:  map[string]map[string]bool{},
 		outbox: make(chan Event, 1024),
 		subs:   map[chan struct{}]struct{}{},
 	}
 }
 
 // Register adds a controller. All controllers must be registered, on every
-// node, before the first event is applied.
-func (r *Runtime) Register(c Controller) {
+// server node, before the first event is applied.
+//
+// nodes are the nodes that run the controller's worker; the controller only
+// hears about those (node.up / node.down / node.ready), so a node that does
+// not run its service never counts as one it has to wait for. No nodes means
+// every node. The list must be the same on every server.
+func (r *Runtime) Register(c Controller, nodes ...string) {
 	if _, dup := r.byName[c.Name()]; dup {
 		panic(fmt.Sprintf("control: controller %q registered twice", c.Name()))
 	}
 	r.controllers = append(r.controllers, c)
 	r.byName[c.Name()] = c
+	if len(nodes) > 0 {
+		set := make(map[string]bool, len(nodes))
+		for _, n := range nodes {
+			set[n] = true
+		}
+		r.scope[c.Name()] = set
+	}
 	c.Start(r)
+}
+
+// Controllers returns the names of the registered controllers, in
+// registration order.
+func (r *Runtime) Controllers() []string {
+	out := make([]string, 0, len(r.controllers))
+	for _, c := range r.controllers {
+		out = append(out, c.Name())
+	}
+	return out
+}
+
+// concerns reports whether node runs the worker of controller.
+func (r *Runtime) concerns(controller, node string) bool {
+	set, ok := r.scope[controller]
+	return !ok || set[node]
 }
 
 // Apply processes one committed event: it updates the shared store, then
@@ -169,6 +201,10 @@ func (r *Runtime) dispatch(ev Event) {
 		return
 	}
 	for _, c := range r.controllers {
+		// Node events go only to the controllers running on that node.
+		if node != "" && !r.concerns(c.Name(), node) {
+			continue
+		}
 		r.deliver(c, ev)
 	}
 }
@@ -254,6 +290,45 @@ func (r *Runtime) PendingOrders(controller, node string) []Order {
 	}
 	slices.SortFunc(out, func(a, b Order) int { return cmp.Compare(a.ID, b.ID) })
 	return out
+}
+
+// AgentState is the part of the replicated state one node's agent works from.
+// A worker-only node has no replica and fetches it from a server.
+type AgentState struct {
+	Node string `json:"node"`
+	Boot string `json:"boot"`
+	// Started lists every registered controller and whether it has started.
+	Started map[string]bool `json:"started"`
+	// Reports holds the node's last replicated report per controller.
+	Reports map[string]json.RawMessage `json:"reports"`
+	// Orders are the node's pending orders, oldest first.
+	Orders []Order `json:"orders"`
+}
+
+// AgentState returns the state the agent of node works from.
+func (r *Runtime) AgentState(node string) AgentState {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	s := AgentState{
+		Node:    node,
+		Boot:    r.store.Boots[node],
+		Started: map[string]bool{},
+		Reports: map[string]json.RawMessage{},
+		Orders:  []Order{},
+	}
+	for _, c := range r.controllers {
+		s.Started[c.Name()] = r.store.Started[c.Name()]
+		if raw, ok := r.store.Reports[c.Name()][node]; ok {
+			s.Reports[c.Name()] = raw
+		}
+	}
+	for _, o := range r.store.Orders {
+		if o.Node == node {
+			s.Orders = append(s.Orders, o)
+		}
+	}
+	slices.SortFunc(s.Orders, func(a, b Order) int { return cmp.Compare(a.ID, b.ID) })
+	return s
 }
 
 type snapshot struct {
@@ -418,6 +493,9 @@ func (r *Runtime) start(c Controller) {
 	r.mu.Unlock()
 
 	for _, node := range slices.Sorted(maps.Keys(alive)) {
+		if !r.concerns(name, node) {
+			continue
+		}
 		ev := EvNodeDown
 		if alive[node] {
 			ev = EvNodeUp
