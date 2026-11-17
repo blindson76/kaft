@@ -118,7 +118,7 @@ func (a *Agent) loop(ctx context.Context, w Worker) {
 
 	// outcomes remembers the result of executed orders until the replica shows
 	// them as no longer pending, so a lost result is re-sent, not re-executed.
-	outcomes := map[uint64]string{}
+	outcomes := map[uint64]outcome{}
 	for {
 		select {
 		case <-ctx.Done():
@@ -168,7 +168,64 @@ func (a *Agent) report(ctx context.Context, w Worker) {
 	})
 }
 
-func (a *Agent) work(ctx context.Context, w Worker, outcomes map[uint64]string) {
+// outcome is how one execution of an order ended.
+type outcome struct {
+	err     string // "" when it succeeded
+	result  any
+	started time.Time
+	took    time.Duration
+}
+
+// event is the order result event for o, re-sent unchanged until committed.
+func (oc outcome) event(node string, id uint64) Event {
+	ev := Event{Name: EvOrderDone, Params: map[string]any{
+		"id":          id,
+		"node":        node,
+		"started_ms":  oc.started.UnixMilli(),
+		"duration_ms": oc.took.Milliseconds(),
+	}}
+	if oc.result != nil {
+		ev.Params["result"] = oc.result
+	}
+	if oc.err != "" {
+		ev.Name = EvOrderFailed
+		ev.Params["error"] = oc.err
+	}
+	return ev
+}
+
+// maxResult bounds an order result as stored in the replicated history.
+const maxResult = 4 << 10
+
+// normalize makes an order result fit for the log: JSON-decoded, so the
+// controller sees what it would after replay, and replaced by a note when it
+// cannot be serialized or is too big.
+func normalize(worker string, id uint64, result any) any {
+	if result == nil {
+		return nil
+	}
+	raw, err := json.Marshal(result)
+	if err != nil {
+		log.Printf("[%s] order #%d result not serializable: %v", worker, id, err)
+		return map[string]any{"error": "result not serializable: " + err.Error()}
+	}
+	if len(raw) > maxResult {
+		return map[string]any{"truncated": true, "bytes": len(raw), "head": string(raw[:maxResult/4])}
+	}
+	var out any
+	_ = json.Unmarshal(raw, &out)
+	return out
+}
+
+// execute runs o on w, through ExecuteResult when w offers it.
+func execute(ctx context.Context, w Worker, o Order) (any, error) {
+	if rw, ok := w.(ResultWorker); ok {
+		return rw.ExecuteResult(ctx, o)
+	}
+	return nil, w.Execute(ctx, o)
+}
+
+func (a *Agent) work(ctx context.Context, w Worker, outcomes map[uint64]outcome) {
 	pending := a.rt.PendingOrders(w.Name(), a.node)
 
 	still := make(map[uint64]bool, len(pending))
@@ -182,10 +239,12 @@ func (a *Agent) work(ctx context.Context, w Worker, outcomes map[uint64]string) 
 	}
 
 	for _, o := range pending {
-		outcome, executed := outcomes[o.ID]
+		oc, executed := outcomes[o.ID]
 		if !executed {
 			log.Printf("[%s] executing order #%d: %s", w.Name(), o.ID, o.Kind)
-			err := w.Execute(ctx, o)
+			oc.started = time.Now()
+			result, err := execute(ctx, w, o)
+			oc.took = time.Since(oc.started)
 			if ctx.Err() != nil {
 				// Interrupted by the node shutting down, which says nothing
 				// about the order: it stays pending and runs again after the
@@ -195,22 +254,17 @@ func (a *Agent) work(ctx context.Context, w Worker, outcomes map[uint64]string) 
 			}
 			if err != nil {
 				log.Printf("[%s] order #%d failed: %v", w.Name(), o.ID, err)
-				outcome = err.Error()
-				if outcome == "" {
-					outcome = "failed"
+				oc.err = err.Error()
+				if oc.err == "" {
+					oc.err = "failed"
 				}
 			}
-			outcomes[o.ID] = outcome
+			oc.result = normalize(w.Name(), o.ID, result)
+			outcomes[o.ID] = oc
 			// Report what the order changed before reporting its outcome, so
 			// the controller never sees "done" with the state from before.
 			a.report(ctx, w)
 		}
-
-		ev := Event{Name: EvOrderDone, Params: map[string]any{"id": o.ID, "node": a.node}}
-		if outcome != "" {
-			ev.Name = EvOrderFailed
-			ev.Params["error"] = outcome
-		}
-		_ = a.submit(ctx, ev)
+		_ = a.submit(ctx, oc.event(a.node, o.ID))
 	}
 }

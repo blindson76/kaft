@@ -85,6 +85,10 @@ type Event struct {
 	Params map[string]any `json:"params,omitempty"`
 	// Internal marks an event a controller raised for itself.
 	Internal bool `json:"internal,omitempty"`
+	// At is when the event was committed, in Unix milliseconds by the
+	// leader's clock. It travels in the log, so every replica sees the same
+	// value; 0 when unknown.
+	At int64 `json:"at,omitempty"`
 }
 
 // RaiseCancel is the event name a controller raises to withdraw its pending
@@ -106,6 +110,34 @@ type Order struct {
 	ID         uint64 `json:"id"`
 	Controller string `json:"controller"`
 	OrderSpec
+	// Placed is when the order was placed (Unix ms, see Event.At), Cause the
+	// committed event the controller was reacting to when it placed it.
+	Placed int64  `json:"placed,omitempty"`
+	Cause  string `json:"cause,omitempty"`
+}
+
+// Order outcomes, as recorded in the order history.
+const (
+	OrderDone      = "done"
+	OrderFailed    = "failed"
+	OrderCancelled = "cancelled"
+)
+
+// OrderRecord is a finished order in the replicated order history.
+type OrderRecord struct {
+	Order
+	// Status is OrderDone, OrderFailed or OrderCancelled.
+	Status string `json:"status"`
+	// Error is the failure message of a failed order.
+	Error string `json:"error,omitempty"`
+	// Result is what the worker returned, for a ResultWorker.
+	Result json.RawMessage `json:"result,omitempty"`
+	// Finished is when the outcome was committed (Unix ms). Started and
+	// DurationMs are when and how long the worker ran it, by the node's
+	// clock; 0 for a cancelled order.
+	Finished   int64 `json:"finished,omitempty"`
+	Started    int64 `json:"started,omitempty"`
+	DurationMs int64 `json:"duration_ms,omitempty"`
 }
 
 // Orders builds the params for raising RaiseOrder:
@@ -180,6 +212,16 @@ type Worker interface {
 	// idempotent: the same order can be delivered again after a retry or a
 	// restart, so check the local state before acting.
 	Execute(ctx context.Context, order Order) error
+}
+
+// ResultWorker is a Worker whose orders produce a value worth keeping, such
+// as what a command printed or the member list it applied. When a worker
+// implements it, the agent calls ExecuteResult instead of Execute; the
+// result, which must be JSON-serializable and small, is stored in the order
+// history and passed to the controller as the "result" parameter.
+type ResultWorker interface {
+	Worker
+	ExecuteResult(ctx context.Context, order Order) (any, error)
 }
 
 // Closer is a Worker that holds local resources: a service process,

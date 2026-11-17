@@ -32,7 +32,14 @@ type store struct {
 	// Started lists the controllers that have been started. A controller
 	// starts the first time its requirements hold, and stays started.
 	Started map[string]bool `json:"started"`
+	// History holds the last finished orders, oldest first, at most
+	// historyLimit of them.
+	History []OrderRecord `json:"history"`
 }
+
+// historyLimit is how many finished orders the store keeps. The history is
+// part of every snapshot, so it is kept small.
+const historyLimit = 300
 
 func newStore() store {
 	return store{
@@ -56,6 +63,11 @@ type Runtime struct {
 	mu     sync.RWMutex
 	store  store
 	active bool
+	// now and cause describe the event being applied: its commit time and
+	// what it is, for the orders placed while reacting to it. Guarded by
+	// applyMu.
+	now   int64
+	cause string
 
 	controllers []Controller
 	byName      map[string]Controller
@@ -127,6 +139,14 @@ func (r *Runtime) Apply(ev Event) {
 	defer r.notify()
 	defer r.applyMu.Unlock()
 
+	r.now, r.cause = ev.At, ev.Name
+	if ev.Target != "" {
+		r.cause = ev.Target + "/" + ev.Name
+	}
+	if node, _ := ev.Params["node"].(string); node != "" {
+		r.cause += " (" + node + ")"
+	}
+
 	// Before: start whatever can start, so that controllers without
 	// requirements see the very first event. After: react to the states the
 	// event led to.
@@ -180,10 +200,25 @@ func (r *Runtime) dispatch(ev Event) {
 		// A result for an order that is no longer pending is a duplicate or
 		// arrives after a cancel: drop it so controllers see each outcome once.
 		id := toUint(ev.Params["id"])
+		rec := OrderRecord{
+			Status:     OrderDone,
+			Finished:   ev.At,
+			Started:    int64(toUint(ev.Params["started_ms"])),
+			DurationMs: int64(toUint(ev.Params["duration_ms"])),
+		}
+		if ev.Name == EvOrderFailed {
+			rec.Status = OrderFailed
+			rec.Error, _ = ev.Params["error"].(string)
+		}
+		if res, ok := ev.Params["result"]; ok && res != nil {
+			rec.Result, _ = json.Marshal(res)
+		}
 		r.mu.Lock()
 		order, ok := r.store.Orders[id]
 		if ok {
 			delete(r.store.Orders, id)
+			rec.Order = order
+			r.record(rec)
 		}
 		r.mu.Unlock()
 		if !ok {
@@ -192,6 +227,9 @@ func (r *Runtime) dispatch(ev Event) {
 		params := map[string]any{"id": id, "node": order.Node, "kind": order.Kind, "args": order.Args}
 		if ev.Name == EvOrderFailed {
 			params["error"] = ev.Params["error"]
+		}
+		if res, ok := ev.Params["result"]; ok {
+			params["result"] = res
 		}
 		ev.Target, ev.Params = order.Controller, params
 	}
@@ -217,7 +255,7 @@ func (r *Runtime) PlaceOrders(controller string, specs []OrderSpec) {
 	defer r.mu.Unlock()
 	for _, spec := range specs {
 		r.store.Seq++
-		r.store.Orders[r.store.Seq] = Order{ID: r.store.Seq, Controller: controller, OrderSpec: spec}
+		r.store.Orders[r.store.Seq] = Order{ID: r.store.Seq, Controller: controller, OrderSpec: spec, Placed: r.now, Cause: r.cause}
 		log.Printf("[%s] order #%d: %s on %s", controller, r.store.Seq, spec.Kind, spec.Node)
 	}
 }
@@ -226,12 +264,34 @@ func (r *Runtime) PlaceOrders(controller string, specs []OrderSpec) {
 func (r *Runtime) CancelOrders(controller string, node string) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	for id, o := range r.store.Orders {
+	// In ID order, so the history is the same on every replica.
+	for _, id := range slices.Sorted(maps.Keys(r.store.Orders)) {
+		o := r.store.Orders[id]
 		if o.Controller == controller && (node == "" || o.Node == node) {
 			delete(r.store.Orders, id)
+			r.record(OrderRecord{Order: o, Status: OrderCancelled, Finished: r.now})
 			log.Printf("[%s] order #%d cancelled", controller, id)
 		}
 	}
+}
+
+// record appends a finished order to the history, dropping the oldest beyond
+// historyLimit. r.mu must be held.
+func (r *Runtime) record(rec OrderRecord) {
+	h := append(r.store.History, rec)
+	if over := len(h) - historyLimit; over > 0 {
+		h = slices.Delete(h, 0, over)
+	}
+	r.store.History = h
+}
+
+// OrderLog returns the pending orders and the order history, both oldest
+// first.
+func (r *Runtime) OrderLog() (pending []Order, history []OrderRecord) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	pending = slices.SortedFunc(maps.Values(r.store.Orders), func(a, b Order) int { return cmp.Compare(a.ID, b.ID) })
+	return pending, slices.Clone(r.store.History)
 }
 
 // Forward implements Host.

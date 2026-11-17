@@ -75,6 +75,27 @@
   .metrics section { overflow-x: auto; }
   svg.spark { vertical-align: middle; margin-left: 6px; }
   svg.spark polyline { fill: none; stroke: var(--accent); stroke-width: 1.5; }
+  .filters { display: flex; flex-wrap: wrap; gap: 8px 12px; align-items: center; margin-bottom: 10px; }
+  .filters select, .filters input { font: inherit; color: var(--text); background: var(--panel); border: 1px solid var(--line);
+                                    border-radius: 6px; padding: 4px 8px; }
+  .filters input { min-width: 200px; flex: 1 1 200px; max-width: 360px; }
+  .counts { display: flex; flex-wrap: wrap; gap: 6px; margin-left: auto; }
+  .st { display: inline-block; font-size: 11px; font-weight: 600; padding: 1px 8px; border-radius: 10px; white-space: nowrap;
+        background: var(--chip); color: var(--muted); border: 1px solid var(--line); }
+  .st.pending { color: var(--warn); border-color: var(--warn); }
+  .st.done { color: var(--ok); border-color: var(--ok); }
+  .st.failed { color: var(--bad); border-color: var(--bad); }
+  button.st { cursor: pointer; font-family: inherit; } button.st.on { background: var(--line); color: var(--text); }
+  .orders-wrap { overflow-x: auto; }
+  .orders tr.o-row { cursor: pointer; } .orders tr.o-row:hover td { background: var(--chip); }
+  .orders tr.open td { border-bottom-color: transparent; }
+  .orders td { white-space: nowrap; } .orders td.wrap { white-space: normal; }
+  .orders tr.detail td { background: var(--chip); padding: 8px 12px; }
+  .detail dl { display: grid; grid-template-columns: max-content minmax(0, 1fr); gap: 4px 14px; margin: 0; }
+  .detail dt { color: var(--muted); } .detail dd { margin: 0; }
+  .detail pre { margin: 0; white-space: pre-wrap; word-break: break-word; font: 12.5px ui-monospace, Consolas, monospace; }
+  .detail .err { color: var(--bad); }
+  .more { margin-top: 8px; font: inherit; color: var(--accent); background: none; border: 0; cursor: pointer; padding: 0; }
 </style>
 </head>
 <body>
@@ -91,11 +112,18 @@
     <section><h2>MongoDB</h2><div id="m-mongo" class="empty">No mongo workers.</div></section>
     <section><h2>Kafka</h2><div id="m-kafka" class="empty">No kafka workers.</div></section>
   </div>
-  <div class="row">
-    <section><h2>Nodes</h2><div class="chips" id="nodes"></div>
-      <div class="note">Dot: liveness as replicated. Each node serves its own replica; open another to compare.</div></section>
-    <section><h2>Pending orders</h2><div id="orders"></div></section>
-  </div>
+  <section><h2>Nodes</h2><div class="chips" id="nodes"></div>
+    <div class="note">Dot: liveness as replicated. Each node serves its own replica; open another to compare.</div></section>
+  <section><h2>Orders</h2>
+    <div class="filters">
+      <select id="f-controller" aria-label="Controller"><option value="">All controllers</option></select>
+      <select id="f-node" aria-label="Node"><option value="">All nodes</option></select>
+      <input id="f-text" type="search" placeholder="Search order, arguments, error, cause…" aria-label="Search">
+      <div class="counts" id="o-counts"></div>
+    </div>
+    <div class="orders-wrap"><div id="orders"></div></div>
+    <div class="note">Pending orders first, then the last finished ones (the cluster keeps 300). Click an order for its arguments, result and error. Times are commit times on the leader.</div>
+  </section>
   <div id="controllers" style="display:grid; gap:16px"></div>
 </main>
 
@@ -245,19 +273,7 @@ function render(state) {
     nodes.append(chip);
   }
 
-  const orders = Object.values(store.orders ?? {}).sort((a, b) => a.id - b.id);
-  if (orders.length === 0) {
-    $('orders').replaceChildren(el('div', 'empty', 'None. Every order has been carried out.'));
-  } else {
-    const table = el('table');
-    table.innerHTML = '<tr><th>#</th><th>Controller</th><th>Node</th><th>Order</th><th>Arguments</th></tr>';
-    for (const o of orders) {
-      const tr = el('tr');
-      tr.append(el('td', 'mono', o.id), el('td', null, o.controller), el('td', null, o.node), el('td', 'mono', o.kind), el('td', 'mono', o.args ? JSON.stringify(o.args) : ''));
-      table.append(tr);
-    }
-    $('orders').replaceChildren(table);
-  }
+  renderOrders(store);
 
   for (const [name, card] of cards) {
     const ctl = (snap.controllers ?? {})[name] ?? {};
@@ -293,6 +309,119 @@ function render(state) {
     }
   }
 }
+
+// --- Orders ------------------------------------------------------------------
+// Pending orders come from store.orders, finished ones from store.history (the
+// replicated history). Filters and opened rows survive repaints.
+const ordersView = { status: '', open: new Set(), shown: 50, store: null };
+const STATUSES = ['pending', 'done', 'failed', 'cancelled'];
+
+function clock(ms) {
+  if (!ms) return '–';
+  const d = new Date(ms), today = new Date().toDateString() === d.toDateString();
+  return today ? d.toLocaleTimeString() : d.toLocaleString();
+}
+function took(ms) {
+  if (ms == null) return '–';
+  return ms < 1000 ? ms + ' ms' : dur(ms / 1000);
+}
+function json(v) { return v == null ? '' : JSON.stringify(v, null, 2); }
+
+function fillSelect(sel, values) {
+  if (sel.options.length > 1) return;
+  for (const v of values) sel.append(new Option(v, v));
+}
+for (const id of ['f-controller', 'f-node']) $(id).addEventListener('change', () => { ordersView.shown = 50; renderOrders(); });
+$('f-text').addEventListener('input', () => { ordersView.shown = 50; renderOrders(); });
+
+function renderOrders(store) {
+  if (store) ordersView.store = store;
+  store = ordersView.store;
+  if (!store || !hello) return;
+  fillSelect($('f-controller'), hello.controllers.map(c => c.name));
+  fillSelect($('f-node'), hello.nodes.map(n => n.id));
+
+  const pending = Object.values(store.orders ?? {}).sort((a, b) => b.id - a.id).map(o => ({ ...o, status: 'pending' }));
+  const history = [...(store.history ?? [])].reverse();
+  const all = [...pending, ...history];
+
+  const fc = $('f-controller').value, fn = $('f-node').value, text = $('f-text').value.trim().toLowerCase();
+  const base = all.filter(o => (!fc || o.controller === fc) && (!fn || o.node === fn) &&
+    (!text || [o.kind, o.cause, o.error, JSON.stringify(o.args ?? ''), JSON.stringify(o.result ?? ''), '#' + o.id]
+      .some(s => s && String(s).toLowerCase().includes(text))));
+
+  // Status buttons double as counts and as the status filter.
+  const counts = $('o-counts');
+  counts.replaceChildren(...['', ...STATUSES].map(s => {
+    const n = s ? base.filter(o => o.status === s).length : base.length;
+    const b = el('button', 'st ' + s + (ordersView.status === s ? ' on' : ''), `${s || 'all'} ${n}`);
+    b.type = 'button';
+    b.addEventListener('click', () => { ordersView.status = s; ordersView.shown = 50; renderOrders(); });
+    return b;
+  }));
+
+  const rows = base.filter(o => !ordersView.status || o.status === ordersView.status);
+  if (rows.length === 0) {
+    const none = all.length === 0 ? 'No orders yet.' : pending.length === 0 && !ordersView.status && !fc && !fn && !text
+      ? 'None pending.' : 'No order matches the filters.';
+    $('orders').replaceChildren(el('div', 'empty', none));
+    return;
+  }
+
+  const table = el('table', 'orders');
+  table.innerHTML = '<tr><th>#</th><th>Status</th><th>Controller</th><th>Node</th><th>Order</th><th>Placed</th><th>Took</th><th>Finished</th><th>Cause</th></tr>';
+  const now = Date.now();
+  for (const o of rows.slice(0, ordersView.shown)) {
+    const key = o.status + o.id;
+    const tr = el('tr', 'o-row' + (ordersView.open.has(key) ? ' open' : ''));
+    const st = el('td'); st.append(el('span', 'st ' + o.status, o.status));
+    if (o.status === 'failed' && o.error) st.title = o.error;
+    const placed = el('td', 'num', clock(o.placed));
+    if (o.placed) placed.title = new Date(o.placed).toLocaleString();
+    let tookText = took(o.duration_ms || (o.status === 'done' || o.status === 'failed' ? 0 : null));
+    if (o.status === 'pending' && o.placed) tookText = 'waiting ' + dur(Math.max(0, now - o.placed) / 1000);
+    tr.append(el('td', 'mono', o.id), st, el('td', null, o.controller), el('td', null, o.node), el('td', 'mono', o.kind),
+      placed, el('td', 'num', tookText), el('td', 'num', o.status === 'pending' ? '–' : clock(o.finished)),
+      el('td', 'mono', short(o.cause ?? '', 40) || '–'));
+    tr.addEventListener('click', () => {
+      if (ordersView.open.has(key)) ordersView.open.delete(key); else ordersView.open.add(key);
+      renderOrders();
+    });
+    table.append(tr);
+    if (ordersView.open.has(key)) table.append(detailRow(o));
+  }
+  const parts = [table];
+  if (rows.length > ordersView.shown) {
+    const more = el('button', 'more', `Show ${Math.min(50, rows.length - ordersView.shown)} more of ${rows.length - ordersView.shown} remaining`);
+    more.type = 'button';
+    more.addEventListener('click', () => { ordersView.shown += 50; renderOrders(); });
+    parts.push(more);
+  }
+  $('orders').replaceChildren(...parts);
+}
+
+function detailRow(o) {
+  const tr = el('tr', 'detail'), td = el('td'), dl = el('dl');
+  td.colSpan = 9;
+  const item = (label, value, cls) => {
+    if (value == null || value === '') return;
+    const dd = el('dd'); const pre = el('pre', cls, value); dd.append(pre);
+    dl.append(el('dt', null, label), dd);
+  };
+  item('Order', `#${o.id} ${o.kind} on ${o.node} for ${o.controller}`);
+  item('Cause', o.cause);
+  item('Arguments', o.args ? json(o.args) : '(none)');
+  item('Error', o.error, 'err');
+  item('Result', o.result != null ? json(o.result) : null);
+  if (o.placed) item('Placed', new Date(o.placed).toLocaleString());
+  if (o.started) item('Ran', `${new Date(o.started).toLocaleString()} for ${took(o.duration_ms ?? 0)} (node clock)`);
+  if (o.finished) item(o.status === 'cancelled' ? 'Cancelled' : 'Committed', new Date(o.finished).toLocaleString());
+  td.append(dl); tr.append(td);
+  return tr;
+}
+
+// The waiting time of pending orders moves on without any state change.
+setInterval(() => { if (Object.keys(ordersView.store?.orders ?? {}).length) renderOrders(); }, 1000);
 
 // --- Live metrics ------------------------------------------------------------
 // Pushed every 2s. Each node reports what it sees; alerts that several nodes

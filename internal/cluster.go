@@ -565,8 +565,10 @@ func (c *Cluster) forwardRaised(ctx context.Context) {
 var ErrNoLeader = errors.New("no raft leader")
 
 // apply commits ev through the local raft node; it fails unless this node is
-// the leader.
+// the leader. The leader stamps the commit time into the entry, so every
+// replica records the same time for it.
 func (c *Cluster) apply(ev control.Event) error {
+	ev.At = time.Now().UnixMilli()
 	payload, err := json.Marshal(ev)
 	if err != nil {
 		return err

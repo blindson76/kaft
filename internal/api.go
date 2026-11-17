@@ -10,6 +10,8 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"slices"
+	"strconv"
 	"time"
 
 	"example.com/dstate/internal/control"
@@ -48,6 +50,8 @@ func postEvent(ctx context.Context, addr string, ev control.Event) error {
 //	GET  /         live view of the state machines (see web.go)
 //	GET  /ws       WebSocket feed behind that view
 //	GET  /metrics  live metrics of its workers (metrics.go)
+//	GET  /orders   pending orders and the order history, newest first;
+//	               filters: ?controller=, ?node=, ?status=, ?limit=
 //
 // plus whatever the controllers added with Handle.
 //
@@ -81,6 +85,7 @@ func (c *Cluster) startHTTP(ctx context.Context) error {
 }
 
 func (c *Cluster) routesTo(mux *http.ServeMux) {
+	mux.HandleFunc("GET /orders", c.serveOrders)
 	mux.HandleFunc("POST /event", func(w http.ResponseWriter, r *http.Request) {
 		var ev control.Event
 		if err := json.NewDecoder(r.Body).Decode(&ev); err != nil {
@@ -121,4 +126,45 @@ func (c *Cluster) routesTo(mux *http.ServeMux) {
 		_, _ = w.Write(uiHTML)
 	})
 	mux.HandleFunc("GET /ws", c.serveWS)
+}
+
+// serveOrders answers GET /orders from this node's replica: the pending orders
+// and the order history, both newest first. Query parameters narrow it down:
+// controller, node and status (pending, done, failed, cancelled) match
+// exactly; limit caps the history (default: all that is kept).
+func (c *Cluster) serveOrders(w http.ResponseWriter, r *http.Request) {
+	q := r.URL.Query()
+	match := func(o control.Order) bool {
+		return (q.Get("controller") == "" || o.Controller == q.Get("controller")) &&
+			(q.Get("node") == "" || o.Node == q.Get("node"))
+	}
+	status := q.Get("status")
+	limit, _ := strconv.Atoi(q.Get("limit"))
+
+	pending, history := c.rt.OrderLog()
+	out := struct {
+		Pending []control.Order       `json:"pending"`
+		History []control.OrderRecord `json:"history"`
+	}{Pending: []control.Order{}, History: []control.OrderRecord{}}
+	if status == "" || status == "pending" {
+		for _, o := range slices.Backward(pending) {
+			if match(o) {
+				out.Pending = append(out.Pending, o)
+			}
+		}
+	}
+	if status != "pending" {
+		for _, rec := range slices.Backward(history) {
+			if limit > 0 && len(out.History) == limit {
+				break
+			}
+			if match(rec.Order) && (status == "" || rec.Status == status) {
+				out.History = append(out.History, rec)
+			}
+		}
+	}
+	w.Header().Set("Content-Type", "application/json")
+	enc := json.NewEncoder(w)
+	enc.SetIndent("", "  ")
+	_ = enc.Encode(out)
 }
