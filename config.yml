@@ -92,17 +92,19 @@ time:
 #       - name: slave
 #         count: 1
 #         args: ["--replicaof", "{host:master}", "6379"]
-# Each node has roles (default: both):
-#   server: runs raft and every enabled controller; counts for
-#           expected_bootstrap and the quorum. Needs raft_addr.
+# Each node has roles (default: both). Every node runs raft and keeps a
+# replica of the cluster state:
+#   server: a raft voter; counts for expected_bootstrap and the quorum, and
+#           can become leader.
 #   worker: runs the workers of the controllers in `controllers` (default:
 #           every enabled one) and carries out their orders. A worker-only
-#           node has no raft; it talks to the leader over http_addr.
-# Every node needs http_addr. Example of a worker-only node running only the
-# time and mongo workers:
+#           node is a raft non-voter: it follows the log but has no vote.
+# Every node needs raft_addr and http_addr. Example of a worker-only node
+# running only the time and mongo workers:
 #   - id: node-5
 #     roles: [worker]
 #     controllers: [time, mongo]
+#     raft_addr: 127.0.0.1:7005
 #     http_addr: 127.0.0.1:8005
 #     mongo_addr: 127.0.0.1:27005
 nodes:

@@ -25,11 +25,13 @@ nodes:
   - id: w1
     roles: [worker]
     controllers: [mongo]
+    raft_addr: 10.0.0.11:7001
     http_addr: 10.0.0.11:8001
     mongo_addr: 10.0.0.11:27017
     dns_names: [db-main]
   - id: w2
     roles: [worker]
+    raft_addr: 10.0.0.12:7001
     http_addr: 10.0.0.12:8001
     mongo_addr: 10.0.0.12:27017
     kafka_id: 1
@@ -39,6 +41,7 @@ nodes:
     roles: [worker]
     controllers: [kafka]
     ip: fd00::13
+    raft_addr: kaft-w3.lan:7001
     http_addr: kaft-w3.lan:8001
     kafka_id: 2
     kafka_addr: 10.0.0.13:9092

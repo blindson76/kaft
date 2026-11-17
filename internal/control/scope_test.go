@@ -1,10 +1,8 @@
 package control
 
 import (
-	"context"
 	"slices"
 	"testing"
-	"time"
 )
 
 // nodeRecorder records the node events it receives.
@@ -46,37 +44,5 @@ func TestNodeEventsAreScoped(t *testing.T) {
 	}
 	if want := []string{"node.up:w2"}; !slices.Equal(late.nodes, want) {
 		t.Errorf("late got %v, want %v", late.nodes, want)
-	}
-}
-
-// A worker-only node's agent works from a RemoteView of a server's runtime and
-// behaves as on a server: it waits for its own boot, then runs its orders once.
-func TestAgentOnRemoteView(t *testing.T) {
-	rt := NewRuntime()
-	rt.Register(fake("svc"), "w1")
-	rt.Apply(Event{Name: EvNodeUp, Params: map[string]any{"node": "w1"}}) // starts svc
-	rt.PlaceOrders("svc", []OrderSpec{{Node: "w1", Kind: "start"}})
-
-	view := NewRemoteView("w1", func(_ context.Context, node string) (AgentState, error) {
-		return rt.AgentState(node), nil
-	})
-	view.interval = 5 * time.Millisecond
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	view.Run(ctx)
-
-	submit := func(_ context.Context, ev Event) error { rt.Apply(ev); return nil }
-	w := &fakeWorker{}
-	a := NewAgent("w1", view, submit, w)
-	a.interval = 5 * time.Millisecond
-	a.Run(ctx)
-
-	waitFor(t, "order to be settled", func() bool { return len(rt.PendingOrders("svc", "w1")) == 0 })
-	time.Sleep(50 * time.Millisecond)
-	if n := w.executed.Load(); n != 1 {
-		t.Fatalf("order executed %d times, want 1", n)
-	}
-	if rt.Report("svc", "w1") == nil {
-		t.Fatal("report not filed through the remote view")
 	}
 }

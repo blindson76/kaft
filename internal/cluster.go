@@ -76,18 +76,17 @@ type Cluster struct {
 	nodesMap map[string]NodeConfig
 	nodeID   string
 	self     NodeConfig
-	// nodes are all node IDs, servers the server ones; both sorted.
-	nodes     []string
-	servers   []string
-	expected  int
+	// nodes are all node IDs, servers the voter ones; both sorted.
+	nodes    []string
+	servers  []string
+	expected int
+	// bsManager is nil on a worker-only node: only voters bootstrap.
 	bsManager *ClusterBootstrapController
-	// r is nil on a worker-only node.
+	// r is nil until Start.
 	r       *raft.Raft
 	rt      *control.Runtime
 	workers []control.Worker
 	routes  map[string]http.HandlerFunc
-	// leader reaches the raft leader from a worker-only node.
-	leader *leaderClient
 
 	// What Start runs, for Shutdown. cancel ends the context everything runs
 	// on; wg tracks the cluster's own loops, observing the raft observer and
@@ -97,7 +96,6 @@ type Cluster struct {
 	observing sync.WaitGroup
 	srv       *http.Server
 	agent     *control.Agent
-	remote    *control.RemoteView
 }
 
 func NewCluster(self string, cfg *ClusterConfig) *Cluster {
@@ -129,17 +127,11 @@ func NewCluster(self string, cfg *ClusterConfig) *Cluster {
 	if nodeCfg.IsServer() {
 		delayBootstrap := time.Second*3 + time.Duration(slices.Index(servers, c.nodeID)*int(time.Second))
 		c.bsManager = NewClusterManager(servers, cfg.ExpectedBootstrap, delayBootstrap, c)
-	} else {
-		addrs := make([]string, 0, len(servers))
-		for _, id := range servers {
-			addrs = append(addrs, nodesMap[id].HTTPAddr)
-		}
-		c.leader = &leaderClient{addrs: addrs}
 	}
 	return c
 }
 
-// IsServer reports whether this node runs raft and the controllers.
+// IsServer reports whether this node is a raft voter.
 func (c *Cluster) IsServer() bool { return c.self.IsServer() }
 
 // RunsWorker reports whether this node runs the worker of controller.
@@ -156,15 +148,14 @@ func (c *Cluster) Handle(pattern string, handler http.HandlerFunc) {
 
 // Register adds a controller and this node's worker for it, before Start.
 //
-// The controller is kept only on a server; every server must register the
-// same controllers with the same nodes. nodes are the nodes that run the
+// Every node keeps a replica of every controller, voter or not, so every node
+// must register the same controllers with the same nodes. Only the leader's
+// controllers act; the others follow the log. nodes are the nodes that run the
 // controller's worker: the controller only hears about their liveness.
 //
 // worker is the local worker, or nil when this node does not run one.
 func (c *Cluster) Register(controller control.Controller, nodes []string, worker control.Worker) {
-	if c.IsServer() {
-		c.rt.Register(controller, nodes...)
-	}
+	c.rt.Register(controller, nodes...)
 	if worker != nil {
 		c.workers = append(c.workers, worker)
 	}
@@ -196,17 +187,18 @@ const (
 	applyTimeout      = 2 * time.Second
 )
 
-// reconcileMembership runs on every server but only acts while this node is
-// the raft leader. Each tick it compares the raft configuration with what is
-// actually reachable: configured servers that are up but not members are added
-// as voters, and members unreachable for deadNodeTimeout are removed so the
-// quorum shrinks with the cluster. Membership never shrinks below `expected`.
-// At most one change is made per tick, since raft applies configuration
-// changes one at a time. Worker-only nodes are never raft members.
+// reconcileMembership runs on every node but only acts while this node is the
+// raft leader. Each tick it compares the raft configuration with what is
+// actually reachable: configured nodes that are up but not members are added,
+// servers as voters and worker-only nodes as non-voters, and members
+// unreachable for deadNodeTimeout are removed. Removing voters shrinks the
+// quorum with the cluster, but never below `expected` voters; non-voters do
+// not count for the quorum and are removed freely. A member whose suffrage
+// does not match its role is promoted or demoted. At most one change is made
+// per tick, since raft applies configuration changes one at a time.
 //
-// The same probes feed the control layer: a liveness change of any node,
-// server or worker, is committed as a node.up / node.down event. Servers are
-// probed on their raft address, worker-only nodes on their HTTP address.
+// The same probes, on the raft address, feed the control layer: a liveness
+// change of any node is committed as a node.up / node.down event.
 func (c *Cluster) reconcileMembership(ctx context.Context) {
 	ticker := time.NewTicker(reconcileInterval)
 	defer ticker.Stop()
@@ -227,10 +219,13 @@ func (c *Cluster) reconcileMembership(ctx context.Context) {
 		if err := cf.Error(); err != nil {
 			continue
 		}
-		servers := cf.Configuration().Servers
-		members := make(map[raft.ServerID]bool, len(servers))
-		for _, s := range servers {
-			members[s.ID] = true
+		members := map[raft.ServerID]raft.ServerSuffrage{}
+		voters := 0
+		for _, s := range cf.Configuration().Servers {
+			members[s.ID] = s.Suffrage
+			if s.Suffrage == raft.Voter {
+				voters++
+			}
 		}
 
 		c.syncLiveness(c.nodeID, true)
@@ -243,20 +238,32 @@ func (c *Cluster) reconcileMembership(ctx context.Context) {
 			id := raft.ServerID(node)
 			cfg := c.nodesMap[node]
 			server := cfg.IsServer()
-			addr, probeAddr := cfg.RaftAddr, cfg.RaftAddr
-			if !server {
-				probeAddr = cfg.HTTPAddr
-			}
+			addr := raft.ServerAddress(cfg.RaftAddr)
+			suffrage, member := members[id]
 
-			if util.ProbeTCP(ctx, probeAddr, probeTimeout) {
+			if util.ProbeTCP(ctx, cfg.RaftAddr, probeTimeout) {
 				delete(downSince, id)
 				c.syncLiveness(node, true)
-				if !server || members[id] || changed {
+				if changed {
 					continue
 				}
-				log.Println("Adding node", node)
-				if err := c.r.AddVoter(id, raft.ServerAddress(addr), 0, membershipTimeout).Error(); err != nil {
-					log.Printf("Add voter error:%v", err)
+				var err error
+				switch {
+				case server && (!member || suffrage != raft.Voter):
+					// AddVoter also promotes an existing non-voter.
+					log.Println("Adding node as voter", node)
+					err = c.r.AddVoter(id, addr, 0, membershipTimeout).Error()
+				case !server && !member:
+					log.Println("Adding node as non-voter", node)
+					err = c.r.AddNonvoter(id, addr, 0, membershipTimeout).Error()
+				case !server && suffrage != raft.Nonvoter:
+					log.Println("Demoting node to non-voter", node)
+					err = c.r.DemoteVoter(id, 0, membershipTimeout).Error()
+				default:
+					continue
+				}
+				if err != nil {
+					log.Printf("Membership change for %s: %v", node, err)
 				}
 				changed = true
 				continue
@@ -271,7 +278,7 @@ func (c *Cluster) reconcileMembership(ctx context.Context) {
 				continue
 			}
 			c.syncLiveness(node, false)
-			if !server || !members[id] || changed || len(servers) <= c.expected {
+			if !member || changed || (suffrage == raft.Voter && voters <= c.expected) {
 				continue
 			}
 			log.Printf("Removing lost node %s (unreachable for %v)", node, time.Since(since).Round(time.Second))
@@ -305,32 +312,26 @@ func (c *Cluster) WaitNode(ctx context.Context, node string) {
 	log.Println("Node ready", node)
 }
 
-// Start runs the node in its roles: raft and the controllers on a server, the
-// agent with its workers on a worker. It returns once everything is running;
-// it all keeps running in the background until ctx ends or Shutdown is
-// called. Call Shutdown in any case, also after Start failed: it stops
-// whatever had been started.
+// Start runs the node in its roles. Every node runs raft with a replica of
+// the controllers: a server as a voter, a worker-only node as a non-voter. A
+// worker also runs the agent with its workers, working from the local replica.
+// It returns once everything is running; it all keeps running in the
+// background until ctx ends or Shutdown is called. Call Shutdown in any case,
+// also after Start failed: it stops whatever had been started.
 func (c *Cluster) Start(ctx context.Context) error {
 	ctx, c.cancel = context.WithCancel(ctx)
 	log.Printf("Node %s roles: %s; workers: %s", c.nodeID, strings.Join(c.self.Roles, ", "), strings.Join(c.workerNames(), ", "))
-	var view control.View = c.rt
-	if c.IsServer() {
-		if err := c.rt.Validate(); err != nil {
-			return fmt.Errorf("invalid controller setup: %w", err)
-		}
-		if err := c.startRaft(ctx); err != nil {
-			return err
-		}
-	} else {
-		c.remote = control.NewRemoteView(c.nodeID, c.fetchAgentState)
-		c.remote.Run(ctx)
-		view = c.remote
+	if err := c.rt.Validate(); err != nil {
+		return fmt.Errorf("invalid controller setup: %w", err)
+	}
+	if err := c.startRaft(ctx); err != nil {
+		return err
 	}
 	if err := c.startHTTP(ctx); err != nil {
 		return err
 	}
 	if len(c.workers) > 0 {
-		c.agent = control.NewAgent(c.nodeID, view, c.Submit, c.workers...)
+		c.agent = control.NewAgent(c.nodeID, c.rt, c.Submit, c.workers...)
 		c.agent.Run(ctx)
 	}
 	if c.IsServer() {
@@ -382,9 +383,6 @@ func (c *Cluster) Shutdown(ctx context.Context) error {
 		if c.agent != nil {
 			c.agent.Wait()
 		}
-		if c.remote != nil {
-			c.remote.Wait()
-		}
 		c.wg.Wait()
 		return nil
 	}))
@@ -404,9 +402,7 @@ func (c *Cluster) Shutdown(ctx context.Context) error {
 			return nil
 		}))
 	}
-	if c.IsServer() {
-		fail("controllers", c.rt.Stop(ctx))
-	}
+	fail("controllers", c.rt.Stop(ctx))
 	return errors.Join(errs...)
 }
 
@@ -423,8 +419,8 @@ func waitFor(ctx context.Context, fn func() error) error {
 	}
 }
 
-// handOverLeadership makes another server the raft leader, the first one in
-// the configuration that answers. A member that is down stays in the
+// handOverLeadership makes another voter the raft leader, the first one in
+// the configuration that answers; non-voters cannot lead. A member that is down stays in the
 // configuration while it holds the quorum size up, so raft's own pick could be
 // a dead one. It is best effort: without it the others elect a leader after
 // the election timeout.
@@ -434,7 +430,7 @@ func (c *Cluster) handOverLeadership(ctx context.Context) {
 		return
 	}
 	for _, s := range cf.Configuration().Servers {
-		if string(s.ID) == c.nodeID || !util.ProbeTCP(ctx, string(s.Address), probeTimeout) {
+		if s.Suffrage != raft.Voter || string(s.ID) == c.nodeID || !util.ProbeTCP(ctx, string(s.Address), probeTimeout) {
 			continue
 		}
 		log.Printf("Shutdown: handing raft leadership over to %s", s.ID)
@@ -458,8 +454,9 @@ func (c *Cluster) workerNames() []string {
 	return names
 }
 
-// startRaft starts this server's raft node and the leader-side loops, which
-// run until ctx ends.
+// startRaft starts this node's raft node and the leader-side loops, which run
+// until ctx ends. A worker-only node starts with no configuration and waits
+// for the leader to add it as a non-voter; it never stands for election.
 func (c *Cluster) startRaft(ctx context.Context) error {
 	nodeID := c.nodeID
 	raftAddr := c.nodesMap[nodeID].RaftAddr
@@ -529,7 +526,9 @@ func (c *Cluster) observe(ctx context.Context, observer *raft.Observer, ch <-cha
 				}
 			}
 		case obs := <-ch:
-			c.bsManager.NotifyBootstraped()
+			if c.bsManager != nil {
+				c.bsManager.NotifyBootstraped()
+			}
 			switch data := obs.Data.(type) {
 			case raft.RaftState:
 				log.Printf("RaftState:%v", data)
@@ -578,11 +577,6 @@ func (c *Cluster) apply(ev control.Event) error {
 // Submit commits ev from any node: directly when this node is the leader,
 // otherwise by handing it to the leader over HTTP.
 func (c *Cluster) Submit(ctx context.Context, ev control.Event) error {
-	if c.r == nil {
-		return c.leader.call(ctx, func(ctx context.Context, addr string) error {
-			return postEvent(ctx, addr, ev)
-		})
-	}
 	if c.r.State() == raft.Leader {
 		return c.apply(ev)
 	}

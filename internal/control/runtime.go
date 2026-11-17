@@ -306,45 +306,6 @@ func (r *Runtime) PendingOrders(controller, node string) []Order {
 	return out
 }
 
-// AgentState is the part of the replicated state one node's agent works from.
-// A worker-only node has no replica and fetches it from a server.
-type AgentState struct {
-	Node string `json:"node"`
-	Boot string `json:"boot"`
-	// Started lists every registered controller and whether it has started.
-	Started map[string]bool `json:"started"`
-	// Reports holds the node's last replicated report per controller.
-	Reports map[string]json.RawMessage `json:"reports"`
-	// Orders are the node's pending orders, oldest first.
-	Orders []Order `json:"orders"`
-}
-
-// AgentState returns the state the agent of node works from.
-func (r *Runtime) AgentState(node string) AgentState {
-	r.mu.RLock()
-	defer r.mu.RUnlock()
-	s := AgentState{
-		Node:    node,
-		Boot:    r.store.Boots[node],
-		Started: map[string]bool{},
-		Reports: map[string]json.RawMessage{},
-		Orders:  []Order{},
-	}
-	for _, c := range r.controllers {
-		s.Started[c.Name()] = r.store.Started[c.Name()]
-		if raw, ok := r.store.Reports[c.Name()][node]; ok {
-			s.Reports[c.Name()] = raw
-		}
-	}
-	for _, o := range r.store.Orders {
-		if o.Node == node {
-			s.Orders = append(s.Orders, o)
-		}
-	}
-	slices.SortFunc(s.Orders, func(a, b Order) int { return cmp.Compare(a.ID, b.ID) })
-	return s
-}
-
 type snapshot struct {
 	Store       store                      `json:"store"`
 	Controllers map[string]json.RawMessage `json:"controllers"`

@@ -17,11 +17,13 @@ import (
 
 // Node roles.
 const (
-	// RoleServer runs raft and the controllers: it holds a replica of the
-	// cluster state and takes part in the quorum.
+	// RoleServer makes the node a raft voter: it takes part in the quorum,
+	// can become leader and then drives the controllers.
 	RoleServer = "server"
 	// RoleWorker runs the workers of the controllers listed in the node's
-	// Controllers: it carries out the orders for its local services.
+	// Controllers: it carries out the orders for its local services. A
+	// worker that is not also a server is a raft non-voter: it keeps a
+	// replica of the cluster state but has no say in the quorum.
 	RoleWorker = "worker"
 )
 
@@ -34,10 +36,10 @@ type NodeConfig struct {
 	// name (mongo, kafka, time). Only meaningful for a worker. Defaults to
 	// every controller enabled in the config.
 	Controllers []string `yaml:"controllers"`
-	// RaftAddr is required for a server.
+	// RaftAddr is required for every node: servers are voters and worker-only
+	// nodes non-voters. The leader also checks liveness against it.
 	RaftAddr string `yaml:"raft_addr"`
-	// HTTPAddr is required for every node: servers take events there, and
-	// the leader checks the liveness of worker-only nodes against it.
+	// HTTPAddr is required for every node: the leader takes events there.
 	HTTPAddr string `yaml:"http_addr"`
 	// MongoAddr is the host:port the node's mongod serves replica set
 	// traffic on; it is also the member host in the replica set config.
@@ -312,7 +314,7 @@ const (
 	ControllerTime  = "time"
 )
 
-// IsServer reports whether the node runs raft and the controllers.
+// IsServer reports whether the node is a raft voter.
 func (n NodeConfig) IsServer() bool { return slices.Contains(n.Roles, RoleServer) }
 
 // IsWorker reports whether the node runs workers.
@@ -434,8 +436,8 @@ func (c *ClusterConfig) Validate() error {
 		if n.HTTPAddr == "" {
 			errs = append(errs, fmt.Errorf("node %s: http_addr is required", n.ID))
 		}
-		if n.IsServer() && n.RaftAddr == "" {
-			errs = append(errs, fmt.Errorf("node %s: a server needs raft_addr", n.ID))
+		if n.RaftAddr == "" {
+			errs = append(errs, fmt.Errorf("node %s: raft_addr is required", n.ID))
 		}
 		if !n.IsWorker() && len(n.Controllers) > 0 {
 			errs = append(errs, fmt.Errorf("node %s: controllers are given but the node is not a worker", n.ID))

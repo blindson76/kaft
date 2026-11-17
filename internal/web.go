@@ -11,6 +11,7 @@ import (
 
 	"example.com/dstate/internal/control"
 	"github.com/coder/websocket"
+	"github.com/hashicorp/raft"
 )
 
 // uiHTML is the live view: a single self-contained page that draws each
@@ -40,22 +41,40 @@ type wsState struct {
 	Raft    string   `json:"raft"`
 	Leader  string   `json:"leader"`
 	Members []string `json:"members"`
+	// Voters are the members with a vote; the others are worker-only nodes.
+	Voters  []string `json:"voters"`
 	Control any      `json:"control"`
+}
+
+// members returns the raft members, voters or not, as this node knows them.
+func (c *Cluster) members() []string { return c.membersWith(nil) }
+
+// voters returns the raft members with a vote.
+func (c *Cluster) voters() []string {
+	v := raft.Voter
+	return c.membersWith(&v)
+}
+
+func (c *Cluster) membersWith(suffrage *raft.ServerSuffrage) []string {
+	out := []string{}
+	if cf := c.r.GetConfiguration(); cf.Error() == nil {
+		for _, s := range cf.Configuration().Servers {
+			if suffrage == nil || s.Suffrage == *suffrage {
+				out = append(out, string(s.ID))
+			}
+		}
+	}
+	return out
 }
 
 func (c *Cluster) currentState() wsState {
 	_, leader := c.r.LeaderWithID()
-	members := []string{}
-	if cf := c.r.GetConfiguration(); cf.Error() == nil {
-		for _, s := range cf.Configuration().Servers {
-			members = append(members, string(s.ID))
-		}
-	}
 	return wsState{
 		Type:    "state",
 		Raft:    c.r.State().String(),
 		Leader:  string(leader),
-		Members: members,
+		Members: c.members(),
+		Voters:  c.voters(),
 		Control: c.rt.Inspect(),
 	}
 }
@@ -89,8 +108,8 @@ func (c *Cluster) serveWS(w http.ResponseWriter, r *http.Request) {
 	}
 
 	hello := wsHello{Type: "hello", Node: c.nodeID, Controllers: c.rt.Diagrams()}
-	// Only servers serve this view.
-	for _, id := range c.servers {
+	// Every node has a replica and serves this view.
+	for _, id := range c.nodes {
 		hello.Nodes = append(hello.Nodes, wsNode{ID: id, HTTP: c.nodesMap[id].HTTPAddr})
 	}
 	if _, err := send(hello); err != nil {

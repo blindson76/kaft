@@ -14,7 +14,7 @@ import (
 
 // Thresholds for alerts.
 const (
-	alertLag        = 10 * time.Second // a secondary this far behind the primary
+	alertLag        = 30 * time.Second // a secondary this far behind the primary
 	alertConnPct    = 80               // connections in use, % of the limit
 	alertOplogFull  = 90               // oplog fill, %, before its window counts
 	alertOplogShort = time.Hour        // a full oplog covering less than this

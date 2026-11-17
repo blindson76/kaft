@@ -22,6 +22,7 @@ nodes:
   - id: w1
     roles: [worker]
     controllers: [time]
+    raft_addr: 10.0.0.5:7003
     http_addr: 10.0.0.5:8003
 `
 
@@ -57,7 +58,8 @@ func TestRolesInvalid(t *testing.T) {
 	cases := map[string]string{
 		"unknown role":               "nodes: [{id: a, roles: [boss], raft_addr: x:1, http_addr: x:2}]",
 		"server needs raft":          "nodes: [{id: a, roles: [server], http_addr: x:2}]",
-		"no server":                  "nodes: [{id: a, roles: [worker], http_addr: x:2}]",
+		"worker needs raft":          "nodes: [{id: s, raft_addr: y:1, http_addr: y:2}, {id: a, roles: [worker], http_addr: x:2}]",
+		"no server":                  "nodes: [{id: a, roles: [worker], raft_addr: x:1, http_addr: x:2}]",
 		"not enabled":                "nodes: [{id: a, controllers: [kafka], raft_addr: x:1, http_addr: x:2}]",
 		"mongo needs addr":           "mongo: {bin: m}\nnodes: [{id: a, raft_addr: x:1, http_addr: x:2}]",
 		"bootstrap > servers":        "expected_bootstrap: 2\nnodes: [{id: a, raft_addr: x:1, http_addr: x:2}]",
@@ -84,8 +86,8 @@ const tasksConfig = `
 expected_bootstrap: 1
 nodes:
   - {id: s1, roles: [server], raft_addr: x:1, http_addr: x:2}
-  - {id: w1, roles: [worker], controllers: [], http_addr: x:3}
-  - {id: w2, roles: [worker], controllers: [], http_addr: x:4}
+  - {id: w1, roles: [worker], controllers: [], raft_addr: x:5, http_addr: x:3}
+  - {id: w2, roles: [worker], controllers: [], raft_addr: x:6, http_addr: x:4}
 tasks:
   - name: api
     command: api.exe

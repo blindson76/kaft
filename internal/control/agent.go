@@ -15,8 +15,8 @@ import (
 // SubmitFunc sends an event towards the raft log, from any node.
 type SubmitFunc func(ctx context.Context, ev Event) error
 
-// View is the replicated state an agent works from. On a server node it is
-// the local Runtime; on a worker-only node, a RemoteView of a server's.
+// View is the replicated state an agent works from: the node's local Runtime,
+// which every node has, voter or not. Tests substitute their own.
 type View interface {
 	// Boot returns the boot ID last announced by node's agent, or "".
 	Boot(node string) string
