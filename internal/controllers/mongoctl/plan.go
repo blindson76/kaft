@@ -69,6 +69,42 @@ type Data struct {
 	// the probe they failed with. They are not tried again until they report
 	// a new probe or the retry delay has passed.
 	Rejected map[string]string `json:"rejected,omitempty"`
+	// Stopping holds the non-members found running mongod and ordered to
+	// stop, with the probe they were found with, so each one is ordered only
+	// once per probe. StrayStops are the ones ordered last.
+	Stopping   map[string]string `json:"stopping,omitempty"`
+	StrayStops []string          `json:"stray_stops,omitempty"`
+}
+
+// alive returns the nodes of nodes that are alive, in the same order.
+func (d Data) alive(nodes []string) []string {
+	var out []string
+	for _, n := range nodes {
+		if d.Alive[n] {
+			out = append(out, n)
+		}
+	}
+	return out
+}
+
+// strays returns the alive nodes outside the established replica set whose
+// mongod runs, typically a member removed while it was unreachable that has
+// come back, except the ones already ordered to stop for their current probe.
+// Sorted by ID.
+func (d Data) strays() []string {
+	if len(d.Members) == 0 {
+		return nil
+	}
+	var out []string
+	for _, n := range d.reported() {
+		r := d.Reports[n]
+		running := r.Status.Role != "" && r.Status.Role != RoleStopped
+		if slices.Contains(d.Members, n) || !running || d.Stopping[n] == r.Boot.ProbeID {
+			continue
+		}
+		out = append(out, n)
+	}
+	return out
 }
 
 func (d Data) Clone() Data {
@@ -77,6 +113,8 @@ func (d Data) Clone() Data {
 	d.Members = slices.Clone(d.Members)
 	d.Await = maps.Clone(d.Await)
 	d.Rejected = maps.Clone(d.Rejected)
+	d.Stopping = maps.Clone(d.Stopping)
+	d.StrayStops = slices.Clone(d.StrayStops)
 	d.Plan.Members = slices.Clone(d.Plan.Members)
 	d.Plan.Wipe = slices.Clone(d.Plan.Wipe)
 	d.Plan.Start = slices.Clone(d.Plan.Start)

@@ -28,7 +28,8 @@ import (
 // Framework event names. Controllers handle these with On(...).
 const (
 	// EvNodeUp / EvNodeDown are broadcast to every controller when the leader
-	// observes a liveness change. Params: "node".
+	// observes a liveness change. Params: "node". Right after EvNodeDown,
+	// the node's pending orders fail with error ErrNodeDown.
 	EvNodeUp   = "node.up"
 	EvNodeDown = "node.down"
 	// EvNodeReady is committed by a node's agent when it starts, and
@@ -104,8 +105,9 @@ type OrderSpec struct {
 
 // Order is a pending OrderSpec recorded in the replicated store. It is state,
 // not a message: it stays in the store until the target node's worker reports
-// a result or the controller cancels it, so it survives leader changes and can
-// be executed more than once.
+// a result, the controller cancels it or the node goes down (it then fails, see
+// EvNodeDown), so it survives leader changes and can be executed more than
+// once.
 type Order struct {
 	ID         uint64 `json:"id"`
 	Controller string `json:"controller"`

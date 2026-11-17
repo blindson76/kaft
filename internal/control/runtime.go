@@ -247,6 +247,48 @@ func (r *Runtime) dispatch(ev Event) {
 		}
 		r.deliver(c, ev)
 	}
+	if ev.Name == EvNodeDown && node != "" {
+		r.failOrdersOf(node)
+	}
+}
+
+// ErrNodeDown is the error of the orders failed by failOrdersOf.
+const ErrNodeDown = "node down"
+
+// failOrdersOf fails every pending order of node, which just went down: the
+// node cannot carry them out, so without this they would stay pending until it
+// comes back, if ever, and the controllers waiting for them would wait until
+// their own timeouts. Each one is recorded as failed and its controller gets
+// EvOrderFailed with error ErrNodeDown, after EvNodeDown, so it already knows
+// the node is down when it reacts.
+//
+// Only the orders pending at this point fail. One placed afterwards for the
+// node, while it is down, stays pending until the node is back or the
+// controller cancels it.
+func (r *Runtime) failOrdersOf(node string) {
+	r.mu.Lock()
+	var failed []Order
+	for _, id := range slices.Sorted(maps.Keys(r.store.Orders)) {
+		o := r.store.Orders[id]
+		if o.Node != node {
+			continue
+		}
+		delete(r.store.Orders, id)
+		r.record(OrderRecord{Order: o, Status: OrderFailed, Error: ErrNodeDown, Finished: r.now})
+		failed = append(failed, o)
+	}
+	r.mu.Unlock()
+
+	for _, o := range failed {
+		log.Printf("[%s] order #%d (%s) failed: %s is down", o.Controller, o.ID, o.Kind, node)
+		c := r.byName[o.Controller]
+		if c == nil {
+			continue
+		}
+		r.deliver(c, Event{Target: o.Controller, Name: EvOrderFailed, At: r.now, Params: map[string]any{
+			"id": o.ID, "node": o.Node, "kind": o.Kind, "args": o.Args, "error": ErrNodeDown,
+		}})
+	}
 }
 
 // PlaceOrders implements Host.

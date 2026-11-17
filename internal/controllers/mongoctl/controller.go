@@ -195,7 +195,9 @@ func NewController(t Topology, requires ...control.Requirement) control.Controll
 				return await(d, specs(OrderWipe, d.Plan.Wipe))
 			}).
 			RaiseWith(control.RaiseOrder, func(d Data) gstate.Params {
-				orders := append(specs(OrderWipe, d.Plan.Wipe), specs(OrderStop, d.Plan.Stop)...)
+				// Leaving members are mostly dead ones, which could never carry
+				// out a stop; strayStop handles them once they are back.
+				orders := append(specs(OrderWipe, d.Plan.Wipe), specs(OrderStop, d.alive(d.Plan.Stop))...)
 				return control.Orders(orders...)
 			}).
 			GoTo("preparing")
@@ -363,6 +365,23 @@ func NewController(t Topology, requires ...control.Requirement) control.Controll
 			reset(sb.Always().Guard(Data.quorumLost), "replica set lost its majority")
 			adoptPlan(sb.Always(), func(d Data) (Plan, bool) { return resizePlan(d, t) })
 			adoptPlan(sb.Always(), rejoinPlan)
+			// A node removed from the set while it was unreachable may come
+			// back with its mongod still running: stop it, once per probe.
+			sb.Always().Guard(func(d Data) bool { return len(d.strays()) > 0 }).
+				Assign(func(d Data) Data {
+					if d.Stopping == nil {
+						d.Stopping = map[string]string{}
+					}
+					d.StrayStops = d.strays()
+					for _, n := range d.StrayStops {
+						log.Printf("[mongo] %s is not a member but runs mongod; stopping it", n)
+						d.Stopping[n] = d.Reports[n].Boot.ProbeID
+					}
+					return d
+				}).
+				RaiseWith(control.RaiseOrder, func(d Data) gstate.Params {
+					return control.Orders(specs(OrderStop, d.StrayStops)...)
+				})
 			// Rejected spares get another chance after a while.
 			sb.After(spareRetry).Raise("spares.retry")
 			sb.On("spares.retry").Guard(func(d Data) bool { return len(d.Rejected) > 0 }).
