@@ -79,3 +79,132 @@ func ids(nodes []NodeConfig) []string {
 	}
 	return out
 }
+
+const tasksConfig = `
+expected_bootstrap: 1
+nodes:
+  - {id: s1, roles: [server], raft_addr: x:1, http_addr: x:2}
+  - {id: w1, roles: [worker], controllers: [], http_addr: x:3}
+  - {id: w2, roles: [worker], controllers: [], http_addr: x:4}
+tasks:
+  - name: api
+    command: api.exe
+    instances: 2
+    nodes: [w2]
+    depends_on: [{controller: kafka, states: [monitoring]}]
+  - name: indexer
+    command: idx.exe
+`
+
+func TestTasks(t *testing.T) {
+	cfg, err := ParseConfigBytes([]byte(tasksConfig))
+	if err != nil {
+		t.Fatal(err)
+	}
+	api, idx := cfg.Tasks[0], cfg.Tasks[1]
+	if got := ids(cfg.TaskNodes(api)); !slices.Equal(got, []string{"w2"}) {
+		t.Errorf("api nodes %v", got)
+	}
+	if got := ids(cfg.TaskNodes(idx)); !slices.Equal(got, []string{"w1", "w2"}) {
+		t.Errorf("indexer nodes %v, want every worker", got)
+	}
+	if idx.Instances != 1 {
+		t.Errorf("indexer instances %d, want the default 1", idx.Instances)
+	}
+	if len(api.DependsOn) != 1 || api.DependsOn[0].Controller != "kafka" {
+		t.Errorf("api depends_on %+v", api.DependsOn)
+	}
+}
+
+func TestTasksInvalid(t *testing.T) {
+	base := "nodes: [{id: a, raft_addr: x:1, http_addr: x:2}, {id: s, roles: [server], raft_addr: y:1, http_addr: y:2}]\n"
+	cases := map[string]string{
+		"no name":        "tasks: [{command: c}]",
+		"bad name":       "tasks: [{name: My_Task, command: c}]",
+		"builtin name":   "tasks: [{name: kafka, command: c}]",
+		"twice":          "tasks: [{name: t, command: c}, {name: t, command: c}]",
+		"no command":     "tasks: [{name: t}]",
+		"unknown node":   "tasks: [{name: t, command: c, nodes: [zz]}]",
+		"not a worker":   "tasks: [{name: t, command: c, nodes: [s]}]",
+		"does not fit":   "tasks: [{name: t, command: c, instances: 3, max_per_node: 2}]",
+		"negative":       "tasks: [{name: t, command: c, instances: -1}]",
+		"listed on node": "tasks: [{name: t, command: c}]\nnodes: [{id: a, controllers: [t], raft_addr: x:1, http_addr: x:2}]",
+	}
+	for name, yml := range cases {
+		doc := yml
+		if !strings.Contains(yml, "nodes: [{") {
+			doc = base + yml
+		}
+		if _, err := ParseConfigBytes([]byte(doc)); err == nil {
+			t.Errorf("%s: accepted", name)
+		} else if !strings.Contains(err.Error(), "invalid config") {
+			t.Errorf("%s: %v", name, err)
+		}
+	}
+}
+
+const rolesTaskConfig = `
+expected_bootstrap: 1
+nodes:
+  - {id: s1, raft_addr: x:1, http_addr: x:2}
+  - {id: s2, raft_addr: y:1, http_addr: y:2}
+tasks:
+  - name: cache
+    command: redis-server.exe
+    args: ["--port", "6379"]
+    max_per_node: 1
+    roles:
+      - name: master
+      - name: slave
+        args: ["--replicaof", "{host:master}", "6379"]
+`
+
+func TestTaskRoles(t *testing.T) {
+	cfg, err := ParseConfigBytes([]byte(rolesTaskConfig))
+	if err != nil {
+		t.Fatal(err)
+	}
+	task := cfg.Tasks[0]
+	if task.Instances != 2 || task.Roles[0].Count != 1 {
+		t.Fatalf("instances %d, roles %+v", task.Instances, task.Roles)
+	}
+	if got := task.RoleRefs(task.Roles[1]); !slices.Equal(got, []string{"master"}) {
+		t.Errorf("slave refers to %v", got)
+	}
+	if got := task.RoleRefs(task.Roles[0]); len(got) != 0 {
+		t.Errorf("master refers to %v", got)
+	}
+}
+
+func TestTaskRolesInvalid(t *testing.T) {
+	base := "nodes: [{id: a, raft_addr: x:1, http_addr: x:2}]\ntasks:\n  - name: t\n    command: c\n"
+	cases := map[string]string{
+		"ref without roles": `    args: ["{host:master}"]`,
+		"unknown role":      `    roles: [{name: slave, args: ["{host:master}"]}]`,
+		"self":              `    roles: [{name: master, args: ["{node:master}"]}]`,
+		"many instances":    `    roles: [{name: master, count: 2}, {name: slave, args: ["{host:master}"]}]`,
+		"cycle":             `    roles: [{name: a, args: ["{host:b}"]}, {name: b, env: {X: "{node:a}"}}]`,
+		"count mismatch":    "    instances: 3\n    roles: [{name: a}, {name: b}]",
+		"duplicate role":    "    roles: [{name: a}, {name: a}]",
+		"bad role name":     "    roles: [{name: Master}]",
+		"negative count":    "    roles: [{name: a, count: -1}]",
+	}
+	want := map[string]string{
+		"ref without roles": "the task has no roles",
+		"unknown role":      "unknown role",
+		"self":              "its own placement",
+		"many instances":    "only a role with one",
+		"cycle":             "cycle",
+		"count mismatch":    "add up to",
+		"duplicate role":    "defined twice",
+		"bad role name":     "lower-case",
+		"negative count":    "at least 1",
+	}
+	for name, yml := range cases {
+		if _, err := ParseConfigBytes([]byte(base + yml + "\n")); err == nil {
+			t.Errorf("%s: accepted", name)
+		} else if !strings.Contains(err.Error(), want[name]) {
+			t.Errorf("%s: %v, want an error about %q", name, err, want[name])
+		}
+	}
+}

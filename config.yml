@@ -53,6 +53,45 @@ time:
 #   zone: service
 #   ttl: 10s
 #   forward: [8.8.8.8]
+# Tasks: any command kept running as `instances` processes on worker nodes.
+# Each task is a controller named after it (states: waiting, degraded,
+# healthy), so it can wait for others and others can wait for it. A process
+# that exits is moved to another node after 5s; the instances of a node that
+# goes down are moved at once. Command, args, dir and env values may use
+# {task}, {instance} (0, 1...) and {node}; the process also gets KAFT_TASK,
+# KAFT_INSTANCE, KAFT_NODE and KAFT_GEN. Output: log_dir/<task>-<instance>.log.
+# tasks:
+#   - name: ingest
+#     command: C:\services\ingest.exe
+#     args: ["--id", "{task}-{instance}", "--kafka", "127.0.0.1:9091"]
+#     env: {INGEST_NODE: "{node}"}
+#     instances: 3
+#     nodes: [node-2, node-3, node-4]  # default: every worker node
+#     max_per_node: 1                  # default 0: no cap, still spread
+#     # log_dir: C:\logs\{node}        # default: <temp>/kaft-tasks/<node>
+#     # stop_timeout: 10s
+#     depends_on:
+#       - controller: kafka
+#         states: [monitoring]
+#   - name: report
+#     command: C:\services\report.exe
+#     depends_on: [{controller: ingest, states: [healthy]}]
+#   # Roles: instances of one task that run with different arguments, e.g. a
+#   # master and a slave, kept on different nodes by max_per_node: 1. A role's
+#   # args come after the task's, its env overrides the task's; {role} and
+#   # {replica} (number within the role) are available. {host:R} / {node:R}
+#   # is where role R's instance runs (R must have count 1): an instance using
+#   # it starts only once R runs, and is restarted with the new value when R
+#   # moves to another node.
+#   - name: cache
+#     command: C:\redis\redis-server.exe
+#     args: ["--port", "6379"]
+#     max_per_node: 1
+#     roles:
+#       - name: master
+#       - name: slave
+#         count: 1
+#         args: ["--replicaof", "{host:master}", "6379"]
 # Each node has roles (default: both):
 #   server: runs raft and every enabled controller; counts for
 #           expected_bootstrap and the quorum. Needs raft_addr.

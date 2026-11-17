@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"regexp"
 	"slices"
 	"strings"
 	"time"
@@ -153,6 +154,82 @@ type MongoConfig struct {
 	DependsOn []control.Requirement `yaml:"depends_on"`
 }
 
+// TaskConfig is a generic task: a command kept running as Instances processes
+// on the worker nodes in Nodes. Each task is a controller of its own, named
+// Name, so other controllers and tasks can depend on it (states: waiting,
+// degraded, healthy).
+type TaskConfig struct {
+	// Name is the task's controller name: lower-case letters, digits and
+	// '-', not the name of a built-in controller.
+	Name string `yaml:"name"`
+	// Command, Args, Dir and Env values may use {task}, {instance} (0, 1...),
+	// {node}, {role}, {replica} and, with roles, {node:R} and {host:R}: the
+	// node and host the instance of role R runs on (see Roles). The process
+	// also gets KAFT_TASK, KAFT_INSTANCE, KAFT_NODE, KAFT_GEN, KAFT_ROLE and
+	// KAFT_REPLICA in its environment.
+	Command string            `yaml:"command"`
+	Args    []string          `yaml:"args"`
+	Env     map[string]string `yaml:"env"`
+	Dir     string            `yaml:"dir"`
+	// Instances is how many processes should run across the nodes. Default 1.
+	// With Roles it is the sum of their counts, and may be left out.
+	Instances int `yaml:"instances"`
+	// Roles splits the instances into kinds that run with different
+	// arguments, e.g. a master and a slave. Instances are numbered in role
+	// order. An instance whose arguments or environment refer to another
+	// role ({node:R}, {host:R}) starts only once that role's instance runs,
+	// and is restarted with the new values when it moves. Use max_per_node: 1
+	// to keep them on different nodes.
+	Roles []TaskRole `yaml:"roles"`
+	// Nodes are the worker nodes the task may run on. Default: every worker.
+	Nodes []string `yaml:"nodes"`
+	// MaxPerNode caps the instances one node runs. Default 0: no cap; the
+	// instances are still spread, the least loaded node first.
+	MaxPerNode int `yaml:"max_per_node"`
+	// LogDir holds the instances' output and pid files; "{node}" is replaced
+	// by the node ID. Default: <temp>/kaft-tasks/<node>.
+	LogDir string `yaml:"log_dir"`
+	// StopTimeout is how long a process gets to exit when stopped before it
+	// is killed (where the OS can ask a process to exit). Default 10s.
+	StopTimeout time.Duration `yaml:"stop_timeout"`
+	// DependsOn lists controllers that must be in given states before any
+	// instance starts, e.g. kafka in monitoring.
+	DependsOn []control.Requirement `yaml:"depends_on"`
+}
+
+// TaskRole is one kind of instance of a task.
+type TaskRole struct {
+	Name string `yaml:"name"`
+	// Count is how many instances have this role. Default 1.
+	Count int `yaml:"count"`
+	// Args come after the task's args; Env entries override the task's.
+	Args []string          `yaml:"args"`
+	Env  map[string]string `yaml:"env"`
+}
+
+// roleRef matches the placeholders that refer to another role's placement.
+var roleRef = regexp.MustCompile(`\{(?:node|host):([^{}]+)\}`)
+
+// RoleRefs returns the roles the instances of role refer to, sorted.
+func (t TaskConfig) RoleRefs(role TaskRole) []string {
+	texts := slices.Concat([]string{t.Command, t.Dir}, t.Args, role.Args)
+	for _, env := range []map[string]string{t.Env, role.Env} {
+		for _, v := range env {
+			texts = append(texts, v)
+		}
+	}
+	var out []string
+	for _, text := range texts {
+		for _, m := range roleRef.FindAllStringSubmatch(text, -1) {
+			if !slices.Contains(out, m[1]) {
+				out = append(out, m[1])
+			}
+		}
+	}
+	slices.Sort(out)
+	return out
+}
+
 type ClusterConfig struct {
 	ExpectedBootstrap int          `yaml:"expected_bootstrap"`
 	Nodes             []NodeConfig `yaml:"nodes"`
@@ -160,6 +237,71 @@ type ClusterConfig struct {
 	Kafka             KafkaConfig  `yaml:"kafka"`
 	Time              TimeConfig   `yaml:"time"`
 	DNS               DNSConfig    `yaml:"dns"`
+	Tasks             []TaskConfig `yaml:"tasks"`
+}
+
+// TaskNodes returns the worker nodes task may run on, in config order.
+func (c *ClusterConfig) TaskNodes(task TaskConfig) []NodeConfig {
+	var out []NodeConfig
+	for _, n := range c.Nodes {
+		if n.IsWorker() && (len(task.Nodes) == 0 || slices.Contains(task.Nodes, n.ID)) {
+			out = append(out, n)
+		}
+	}
+	return out
+}
+
+// taskName is what a task may be called: it is a controller name and shows up
+// in file names.
+var taskName = regexp.MustCompile(`^[a-z0-9]([a-z0-9-]*[a-z0-9])?$`)
+
+// validateTasks checks the tasks.
+func (c *ClusterConfig) validateTasks() []error {
+	var errs []error
+	builtin := []string{ControllerMongo, ControllerKafka, ControllerTime}
+	seen := map[string]bool{}
+	for i, t := range c.Tasks {
+		what := fmt.Sprintf("task %q", t.Name)
+		switch {
+		case t.Name == "":
+			errs = append(errs, fmt.Errorf("task #%d has no name", i+1))
+			continue
+		case !taskName.MatchString(t.Name):
+			errs = append(errs, fmt.Errorf("%s: a name has lower-case letters, digits and '-' only", what))
+		case slices.Contains(builtin, t.Name):
+			errs = append(errs, fmt.Errorf("%s: the name of a built-in controller", what))
+		case seen[t.Name]:
+			errs = append(errs, fmt.Errorf("%s: defined twice", what))
+		}
+		seen[t.Name] = true
+		if t.Command == "" {
+			errs = append(errs, fmt.Errorf("%s: command is required", what))
+		}
+		if t.Instances < 1 {
+			errs = append(errs, fmt.Errorf("%s: instances must be at least 1", what))
+		}
+		if t.MaxPerNode < 0 {
+			errs = append(errs, fmt.Errorf("%s: max_per_node cannot be negative", what))
+		}
+		errs = append(errs, t.validateRoles(what)...)
+		for _, id := range t.Nodes {
+			n, ok := c.Node(id)
+			switch {
+			case !ok:
+				errs = append(errs, fmt.Errorf("%s: unknown node %q", what, id))
+			case !n.IsWorker():
+				errs = append(errs, fmt.Errorf("%s: node %s is not a worker", what, id))
+			}
+		}
+		nodes := len(c.TaskNodes(t))
+		switch {
+		case nodes == 0:
+			errs = append(errs, fmt.Errorf("%s: no worker node to run on", what))
+		case t.MaxPerNode > 0 && t.Instances > t.MaxPerNode*nodes:
+			errs = append(errs, fmt.Errorf("%s: %d instance(s) do not fit on %d node(s) with max_per_node %d", what, t.Instances, nodes, t.MaxPerNode))
+		}
+	}
+	return errs
 }
 
 // Controller names, as used in NodeConfig.Controllers. They match the names
@@ -255,6 +397,19 @@ func (c *ClusterConfig) normalize() {
 			n.Controllers = slices.Clone(enabled)
 		}
 	}
+	for i := range c.Tasks {
+		t := &c.Tasks[i]
+		sum := 0
+		for j := range t.Roles {
+			if t.Roles[j].Count == 0 {
+				t.Roles[j].Count = 1
+			}
+			sum += t.Roles[j].Count
+		}
+		if t.Instances == 0 {
+			t.Instances = max(sum, 1)
+		}
+	}
 }
 
 // Validate checks the node roles and controller assignments.
@@ -286,6 +441,10 @@ func (c *ClusterConfig) Validate() error {
 			errs = append(errs, fmt.Errorf("node %s: controllers are given but the node is not a worker", n.ID))
 		}
 		for _, name := range n.Controllers {
+			if slices.ContainsFunc(c.Tasks, func(t TaskConfig) bool { return t.Name == name }) {
+				errs = append(errs, fmt.Errorf("node %s: %q is a task; a task lists its nodes itself (tasks: nodes)", n.ID, name))
+				continue
+			}
 			if !slices.Contains(enabled, name) {
 				errs = append(errs, fmt.Errorf("node %s: controller %q is unknown or not enabled (enabled: %s)", n.ID, name, strings.Join(enabled, ", ")))
 			}
@@ -297,6 +456,7 @@ func (c *ClusterConfig) Validate() error {
 			errs = append(errs, fmt.Errorf("node %s: the kafka worker needs kafka_addr and kafka_controller_addr", n.ID))
 		}
 	}
+	errs = append(errs, c.validateTasks()...)
 	servers := len(c.Servers())
 	if servers == 0 {
 		errs = append(errs, errors.New("no server node"))
@@ -337,4 +497,74 @@ func ParseConfigBytes(data []byte) (*ClusterConfig, error) {
 		return nil, fmt.Errorf("invalid config: %w", err)
 	}
 	return &cfg, nil
+}
+
+// validateRoles checks a task's roles and the references between them.
+func (t TaskConfig) validateRoles(what string) []error {
+	var errs []error
+	count := map[string]int{}
+	sum := 0
+	for _, r := range t.Roles {
+		switch {
+		case !taskName.MatchString(r.Name):
+			errs = append(errs, fmt.Errorf("%s: role %q: a name has lower-case letters, digits and '-' only", what, r.Name))
+		case count[r.Name] > 0:
+			errs = append(errs, fmt.Errorf("%s: role %q defined twice", what, r.Name))
+		case r.Count < 1:
+			errs = append(errs, fmt.Errorf("%s: role %q: count must be at least 1", what, r.Name))
+		}
+		count[r.Name] = max(r.Count, 1)
+		sum += r.Count
+	}
+	if len(t.Roles) == 0 {
+		if refs := t.RoleRefs(TaskRole{}); len(refs) > 0 {
+			errs = append(errs, fmt.Errorf("%s: {node:%s} / {host:%s} refer to a role, but the task has no roles", what, refs[0], refs[0]))
+		}
+		return errs
+	}
+	if t.Instances != sum {
+		errs = append(errs, fmt.Errorf("%s: instances is %d but the roles add up to %d", what, t.Instances, sum))
+	}
+	refs := map[string][]string{}
+	for _, r := range t.Roles {
+		refs[r.Name] = t.RoleRefs(r)
+		for _, ref := range refs[r.Name] {
+			switch {
+			case ref == r.Name:
+				errs = append(errs, fmt.Errorf("%s: role %q refers to its own placement", what, r.Name))
+			case count[ref] == 0:
+				errs = append(errs, fmt.Errorf("%s: role %q refers to unknown role %q", what, r.Name, ref))
+			case count[ref] > 1:
+				errs = append(errs, fmt.Errorf("%s: role %q refers to role %q, which has %d instances: only a role with one can be referred to", what, r.Name, ref, count[ref]))
+			}
+		}
+	}
+	// A cycle would leave every role in it waiting for another to run.
+	state := map[string]int{} // 1 visiting, 2 done
+	var visit func(role string, path []string) error
+	visit = func(role string, path []string) error {
+		switch state[role] {
+		case 1:
+			return fmt.Errorf("%s: roles refer to each other in a cycle: %s", what, strings.Join(append(path, role), " -> "))
+		case 2:
+			return nil
+		}
+		state[role] = 1
+		for _, ref := range refs[role] {
+			if ref != role && count[ref] > 0 {
+				if err := visit(ref, append(path, role)); err != nil {
+					return err
+				}
+			}
+		}
+		state[role] = 2
+		return nil
+	}
+	for _, r := range t.Roles {
+		if err := visit(r.Name, nil); err != nil {
+			errs = append(errs, err)
+			break
+		}
+	}
+	return errs
 }

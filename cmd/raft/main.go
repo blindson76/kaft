@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"slices"
 	"strings"
 	"syscall"
 	"time"
@@ -17,6 +18,7 @@ import (
 	"example.com/dstate/internal/control"
 	"example.com/dstate/internal/controllers/kafkactl"
 	"example.com/dstate/internal/controllers/mongoctl"
+	"example.com/dstate/internal/controllers/taskctl"
 	"example.com/dstate/internal/controllers/timectl"
 )
 
@@ -50,6 +52,9 @@ func main() {
 	}
 	if cfg.Time.StateFile != "" {
 		registerTime(cluster, nodeID, cfg)
+	}
+	for _, t := range cfg.Tasks {
+		registerTask(cluster, nodeID, t, cfg)
 	}
 
 	stopDNS, err := internal.StartDNS(cfg, nodeID)
@@ -204,6 +209,43 @@ func registerTime(cluster *internal.Cluster, nodeID string, cfg *internal.Cluste
 	for pattern, handler := range timectl.Routes(cluster.Submit) {
 		cluster.Handle(pattern, handler)
 	}
+}
+
+// registerTask adds a task's controller, and its worker if this node is one
+// of the nodes the task may run on.
+func registerTask(cluster *internal.Cluster, nodeID string, t internal.TaskConfig, cfg *internal.ClusterConfig) {
+	nodes := cfg.TaskNodes(t)
+	topology := taskctl.Topology{Instances: t.Instances, MaxPerNode: t.MaxPerNode, Nodes: ids(nodes), Hosts: map[string]string{}}
+	for _, n := range nodes {
+		topology.Hosts[n.ID] = cmp.Or(n.IP, n.Host())
+	}
+	roles := map[string]taskctl.RoleConfig{}
+	for _, r := range t.Roles {
+		roles[r.Name] = taskctl.RoleConfig{Args: r.Args, Env: r.Env}
+		for i := range r.Count {
+			topology.Slots = append(topology.Slots, taskctl.Slot{Role: r.Name, Replica: i, Refs: t.RoleRefs(r)})
+		}
+	}
+
+	var worker control.Worker
+	if slices.Contains(topology.Nodes, nodeID) {
+		logDir := filepath.Join(os.TempDir(), "kaft-tasks", nodeID)
+		if t.LogDir != "" {
+			logDir = strings.ReplaceAll(t.LogDir, "{node}", nodeID)
+		}
+		worker = taskctl.NewWorker(taskctl.WorkerConfig{
+			Task:        t.Name,
+			Node:        nodeID,
+			Command:     t.Command,
+			Args:        t.Args,
+			Env:         t.Env,
+			Dir:         t.Dir,
+			Roles:       roles,
+			LogDir:      logDir,
+			StopTimeout: t.StopTimeout,
+		})
+	}
+	cluster.Register(taskctl.NewController(t.Name, topology, t.DependsOn...), topology.Nodes, worker)
 }
 
 // maxVoters is MongoDB's limit on voting members in a replica set.
